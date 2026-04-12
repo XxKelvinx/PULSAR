@@ -1,6 +1,6 @@
 # PULSAR
 
-![PULSAR banner](Pictures/PulsarLandscapeFormat.png)
+![PULSAR banner](Pictures/PulsarBanner.png)
 
 PULSAR is an experimental offline transform codec prototype focused on adaptive block switching, transient-aware planning, and transparent reconstruction.
 

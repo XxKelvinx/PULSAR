@@ -21,6 +21,30 @@ public sealed class PulsarBitstreamWriter
 		_buffer.AddRange(BitConverter.GetBytes(value));
 	}
 
+	public void WriteByte(byte value)
+	{
+		FlushBits();
+		_buffer.Add(value);
+	}
+
+	public void WriteUInt16(ushort value)
+	{
+		FlushBits();
+		_buffer.AddRange(BitConverter.GetBytes(value));
+	}
+
+	public void WriteUInt32(uint value)
+	{
+		FlushBits();
+		_buffer.AddRange(BitConverter.GetBytes(value));
+	}
+
+	public void WriteUInt64(ulong value)
+	{
+		FlushBits();
+		_buffer.AddRange(BitConverter.GetBytes(value));
+	}
+
 	public void WriteSingle(float value)
 	{
 		FlushBits();

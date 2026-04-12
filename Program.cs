@@ -2,6 +2,10 @@ using NAudio.Wave;
 using System.Diagnostics;
 using System.Globalization;
 using System.Threading.Tasks;
+using Pulsar.Psycho;
+
+const int PulsarWorkingSampleRate = 44100;
+const int PulsarJointStereoThresholdKbps = 160;
 
 var workspaceRoot = FindWorkspaceRoot();
 var defaultInputPath = Path.Combine(workspaceRoot, "TestWAVs", "Strike A Pose! 30s.wav");
@@ -19,26 +23,64 @@ if (args.Length == 3 && args[0] == "--compare")
     return;
 }
 
-bool useVbrMode = args.Length >= 4 && args[0] == "--vbr";
+var cliArgs = new List<string>(args);
+int? vbrQuality = null;
+for (int i = 0; i < cliArgs.Count; i++)
+{
+    if (cliArgs[i] != "-V" && cliArgs[i] != "--quality")
+    {
+        continue;
+    }
+
+    if (i + 1 >= cliArgs.Count || !int.TryParse(cliArgs[i + 1], out int parsedQuality) || parsedQuality < 0 || parsedQuality > 9)
+    {
+        Console.Error.WriteLine("Invalid VBR quality. Use -V <0-9> with 0 = best quality and 9 = strongest compression.");
+        Environment.Exit(1);
+        return;
+    }
+
+    vbrQuality = parsedQuality;
+    cliArgs.RemoveAt(i + 1);
+    cliArgs.RemoveAt(i);
+    break;
+}
+
+args = cliArgs.ToArray();
+
+bool useVbrPlsrMode = args.Length >= 4 && args[0] == "--vbrplsr";
+bool useVbrPlsrPcmMode = args.Length >= 3 && args[0] == "--vbrplsrpcm";
+bool useDecodePlsrMode = args.Length >= 3 && args[0] == "--decodeplsr";
+bool useVbrMode = args.Length >= 3 && args[0] == "--vbr";
 bool useLegacyMode = args.Length >= 3 && args[0] == "--legacy";
 bool useLegacyPlannerMode = args.Length >= 3 && args[0] == "--legacyP";
 bool useLegacyPlannerFastMode = args.Length >= 3 && args[0] == "--legacyP-fast";
 int legacyBlockSize = PulsarBlockLadder.DefaultBlockSize;
-int targetKbps = 128;
+int effectiveVbrQuality = vbrQuality ?? 4;
+int targetKbps = QualityToNominalKbps(effectiveVbrQuality);
 string inputPath;
 string outputPath;
+string? decodedOutputPath = null;
 
-if (useVbrMode)
+if (useVbrPlsrMode)
 {
-	if (!int.TryParse(args[1], out targetKbps) || targetKbps < 16 || targetKbps > 480)
-	{
-		Console.Error.WriteLine("Invalid VBR target bitrate. Use a number between 16 and 480.");
-		Environment.Exit(1);
-		return;
-	}
-
-	inputPath = Path.GetFullPath(args[2]);
-	outputPath = Path.GetFullPath(args[3]);
+	inputPath = Path.GetFullPath(args[1]);
+	outputPath = Path.GetFullPath(args[2]);
+	decodedOutputPath = Path.GetFullPath(args[3]);
+}
+else if (useVbrPlsrPcmMode)
+{
+	inputPath = Path.GetFullPath(args[1]);
+	outputPath = Path.GetFullPath(args[2]);
+}
+else if (useDecodePlsrMode)
+{
+	inputPath = Path.GetFullPath(args[1]);
+	outputPath = Path.GetFullPath(args[2]);
+}
+else if (useVbrMode)
+{
+	inputPath = Path.GetFullPath(args[1]);
+	outputPath = Path.GetFullPath(args[2]);
 }
 else if (useLegacyMode)
 {
@@ -75,18 +117,48 @@ if (!File.Exists(inputPath))
 
 PrepareOutputFolder(outputPath);
 outputPath = ResolveWritableOutputPath(outputPath);
+if (decodedOutputPath is not null)
+{
+	PrepareOutputFolder(decodedOutputPath);
+	decodedOutputPath = ResolveWritableOutputPath(decodedOutputPath);
+}
 
-using var reader = new AudioFileReader(inputPath);
-int channels = reader.WaveFormat.Channels;
-int sampleRate = reader.WaveFormat.SampleRate;
+if (useDecodePlsrMode)
+{
+	var archive = File.ReadAllBytes(inputPath);
+	var decoded = PulsarSuperframeArchiveCodec.DecodeArchive(archive);
+	var decodedArchiveFormat = WaveFormat.CreateIeeeFloatWaveFormat(decoded.SampleRate, decoded.Channels);
+	using (var writer = new WaveFileWriter(outputPath, decodedArchiveFormat))
+	{
+		writer.WriteSamples(decoded.Samples, 0, decoded.Samples.Length);
+	}
 
-var samples = ReadAllSamples(reader);
+	Console.WriteLine($"PULSAR archive decoded: {outputPath}");
+	return;
+}
+
+var inputAudio = ReadAudioFile(inputPath);
+int channels = inputAudio.WaveFormat.Channels;
+int inputSampleRate = inputAudio.WaveFormat.SampleRate;
+int sampleRate = PulsarWorkingSampleRate;
+
+var samples = ResampleInterleaved(inputAudio.Samples, channels, inputSampleRate, sampleRate);
 object ProgressLock = new();
 float[] processed;
 PulsarPlanner[]? planners = null;
 List<PulsarFrameAllocation>[]? allocationsByChannel = null;
+byte[]? pulsrArchive = null;
 
-if (useLegacyMode)
+if (useVbrPlsrMode)
+{
+	processed = Array.Empty<float>();
+}
+else if (useVbrPlsrPcmMode)
+{
+	pulsrArchive = PulsarSuperframeArchiveCodec.EncodeSpectralArchive(samples, sampleRate, channels, targetKbps, effectiveVbrQuality);
+	processed = Array.Empty<float>();
+}
+else if (useLegacyMode)
 {
 	processed = ProcessLegacy(samples, channels, legacyBlockSize);
 }
@@ -100,13 +172,41 @@ else if (useLegacyPlannerMode || useLegacyPlannerFastMode)
 }
 else
 {
-	(processed, planners, allocationsByChannel) = ProcessWithPulsar(samples, channels, sampleRate, targetKbps);
+	(processed, planners, allocationsByChannel) = ProcessWithPulsar(samples, channels, sampleRate, targetKbps, effectiveVbrQuality);
+}
+
+if (useVbrPlsrMode)
+{
+	byte[] archive = PulsarSuperframeArchiveCodec.EncodeSpectralArchive(samples, sampleRate, channels, targetKbps, effectiveVbrQuality);
+	File.WriteAllBytes(outputPath, archive);
+
+	var decoded = PulsarSuperframeArchiveCodec.DecodeArchive(archive);
+	var decodedFormat = WaveFormat.CreateIeeeFloatWaveFormat(decoded.SampleRate, decoded.Channels);
+	using (var writer = new WaveFileWriter(decodedOutputPath!, decodedFormat))
+	{
+		writer.WriteSamples(decoded.Samples, 0, decoded.Samples.Length);
+	}
+
+	WriteResidualComparison(inputPath, decodedOutputPath!);
+
+	double seconds = decoded.Samples.Length / (double)(decoded.SampleRate * decoded.Channels);
+	double avgKbps = archive.Length * 8.0 / Math.Max(seconds, 1e-9) / 1000.0;
+	Console.WriteLine($"PULSAR archive encoded: {outputPath} ({avgKbps:0.00} kbps)");
+	Console.WriteLine($"PULSAR archive decoded WAV: {decodedOutputPath}");
+	return;
+}
+
+if (useVbrPlsrPcmMode)
+{
+	File.WriteAllBytes(outputPath, pulsrArchive!);
+	Console.WriteLine($"PULSAR PCM archive written: {outputPath}");
+	return;
 }
 
 var outputFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels);
 using (var writer = new WaveFileWriter(outputPath, outputFormat))
 {
-    writer.WriteSamples(processed, 0, processed.Length);
+	writer.WriteSamples(processed, 0, processed.Length);
 }
 
 if (!useLegacyMode && planners is not null)
@@ -121,6 +221,8 @@ if (!useLegacyMode && planners is not null)
 
 Console.WriteLine(useLegacyMode
     ? $"Legacy direct render complete: {outputPath} (blockSize={legacyBlockSize})"
+    : useVbrPlsrPcmMode
+        ? $"PULSAR spectral PCM render complete: {outputPath}"
     : useLegacyPlannerFastMode
         ? $"Legacy planner-only fast render complete: {outputPath}"
         : useLegacyPlannerMode
@@ -194,10 +296,30 @@ static string BuildTimestampedPath(string outputPath)
     return Path.Combine(directory, $"{baseName}-{timestamp}{extension}");
 }
 
-static float[] ReadAllSamples(AudioFileReader reader)
+static (float[] Samples, WaveFormat WaveFormat) ReadAudioFile(string path)
+{
+    string extension = Path.GetExtension(path);
+    if (string.Equals(extension, ".wav", StringComparison.OrdinalIgnoreCase))
+    {
+        using var waveReader = new WaveFileReader(path);
+        return (ReadAllWaveSamples(waveReader), waveReader.WaveFormat);
+    }
+
+    if (string.Equals(extension, ".pulsr", StringComparison.OrdinalIgnoreCase) || string.Equals(extension, ".plsr", StringComparison.OrdinalIgnoreCase))
+    {
+        byte[] archive = File.ReadAllBytes(path);
+        var decoded = PulsarSuperframeArchiveCodec.DecodeArchive(archive);
+        return (decoded.Samples, WaveFormat.CreateIeeeFloatWaveFormat(decoded.SampleRate, decoded.Channels));
+    }
+
+    using var audioReader = new AudioFileReader(path);
+    return (ReadAllSamples(audioReader, audioReader.WaveFormat), audioReader.WaveFormat);
+}
+
+static float[] ReadAllSamples(ISampleProvider reader, WaveFormat waveFormat)
 {
     var allSamples = new List<float>();
-    var buffer = new float[reader.WaveFormat.SampleRate * reader.WaveFormat.Channels];
+    var buffer = new float[waveFormat.SampleRate * waveFormat.Channels];
 
     int read;
     while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
@@ -211,7 +333,106 @@ static float[] ReadAllSamples(AudioFileReader reader)
     return allSamples.ToArray();
 }
 
-static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>[] Allocations) ProcessWithPulsar(float[] interleavedSamples, int channels, int sampleRate, int targetKbps)
+static float[] ReadAllWaveSamples(WaveFileReader reader)
+{
+    var format = reader.WaveFormat;
+    int bytesPerSample = format.BitsPerSample / 8;
+    int frameSize = format.BlockAlign;
+    if (bytesPerSample <= 0 || frameSize <= 0)
+    {
+        throw new InvalidOperationException($"Unsupported WAV format: {format.Encoding}, {format.BitsPerSample}-bit.");
+    }
+
+    var allSamples = new List<float>((int)(reader.Length / Math.Max(1, bytesPerSample)));
+    byte[] buffer = new byte[Math.Max(frameSize * 4096, frameSize)];
+
+    int read;
+    while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+    {
+        int framesRead = read / frameSize;
+        int offset = 0;
+
+        for (int frame = 0; frame < framesRead; frame++)
+        {
+            for (int channel = 0; channel < format.Channels; channel++)
+            {
+                allSamples.Add(ReadSample(buffer, offset, format.Encoding, format.BitsPerSample));
+                offset += bytesPerSample;
+            }
+        }
+    }
+
+    return allSamples.ToArray();
+}
+
+static float[] ResampleInterleaved(float[] samples, int channels, int sourceSampleRate, int targetSampleRate)
+{
+    if (channels <= 0)
+    {
+        throw new ArgumentOutOfRangeException(nameof(channels));
+    }
+
+    if (sourceSampleRate <= 0 || targetSampleRate <= 0)
+    {
+        throw new ArgumentOutOfRangeException(sourceSampleRate <= 0 ? nameof(sourceSampleRate) : nameof(targetSampleRate));
+    }
+
+    if (sourceSampleRate == targetSampleRate || samples.Length == 0)
+    {
+        return samples;
+    }
+
+    int sourceFrames = samples.Length / channels;
+    int targetFrames = Math.Max(1, (int)Math.Round(sourceFrames * (targetSampleRate / (double)sourceSampleRate)));
+    float[] resampled = new float[targetFrames * channels];
+    double frameScale = sourceSampleRate / (double)targetSampleRate;
+
+    for (int targetFrame = 0; targetFrame < targetFrames; targetFrame++)
+    {
+        double sourcePosition = targetFrame * frameScale;
+        int leftFrame = Math.Clamp((int)Math.Floor(sourcePosition), 0, sourceFrames - 1);
+        int rightFrame = Math.Clamp(leftFrame + 1, 0, sourceFrames - 1);
+        float t = (float)(sourcePosition - leftFrame);
+
+        for (int channel = 0; channel < channels; channel++)
+        {
+            float left = samples[(leftFrame * channels) + channel];
+            float right = samples[(rightFrame * channels) + channel];
+            resampled[(targetFrame * channels) + channel] = left + ((right - left) * t);
+        }
+    }
+
+    return resampled;
+}
+
+static float ReadSample(byte[] buffer, int offset, WaveFormatEncoding encoding, int bitsPerSample)
+{
+    return encoding switch
+    {
+        WaveFormatEncoding.Pcm when bitsPerSample == 16 => BitConverter.ToInt16(buffer, offset) / 32768f,
+        WaveFormatEncoding.Pcm when bitsPerSample == 24 => ReadPcm24(buffer, offset) / 8388608f,
+        WaveFormatEncoding.Pcm when bitsPerSample == 32 => BitConverter.ToInt32(buffer, offset) / 2147483648f,
+        WaveFormatEncoding.Extensible when bitsPerSample == 16 => BitConverter.ToInt16(buffer, offset) / 32768f,
+        WaveFormatEncoding.Extensible when bitsPerSample == 24 => ReadPcm24(buffer, offset) / 8388608f,
+        WaveFormatEncoding.Extensible when bitsPerSample == 32 => BitConverter.ToInt32(buffer, offset) / 2147483648f,
+        WaveFormatEncoding.IeeeFloat when bitsPerSample == 32 => BitConverter.ToSingle(buffer, offset),
+        WaveFormatEncoding.IeeeFloat when bitsPerSample == 64 => (float)BitConverter.ToDouble(buffer, offset),
+        _ => throw new InvalidOperationException($"Unsupported WAV encoding: {encoding}, {bitsPerSample}-bit.")
+    };
+}
+
+static int ReadPcm24(byte[] buffer, int offset)
+{
+    int value = buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+    if ((value & 0x800000) != 0)
+    {
+        value |= unchecked((int)0xFF000000);
+    }
+
+    return value;
+}
+
+static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>[] Allocations) ProcessWithPulsar(float[] interleavedSamples, int channels, int sampleRate, int targetKbps, int vbrQuality)
 {
 	var channelBuffers = new float[channels][];
 	var planners = new PulsarPlanner[channels];
@@ -231,11 +452,17 @@ static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>
 		}
 	}
 
+	bool useMidSideStereo = channels == 2 && targetKbps <= PulsarJointStereoThresholdKbps;
+	if (useMidSideStereo)
+	{
+		ApplyMidSideStereo(channelBuffers[0], channelBuffers[1]);
+	}
+
 	var processedChannels = new float[channels][];
 	var allocations = new List<PulsarFrameAllocation>[channels];
 	var allocator = new PulsarAllocator(new PulsarAllocationConfig
 	{
-		TargetKbps = targetKbps,
+		Quality = vbrQuality,
 		SampleRate = sampleRate,
 		HopSize = PulsarBlockLadder.ControlHopSize,
 	});
@@ -243,11 +470,35 @@ static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>
 	Parallel.For(0, channels, channel =>
 	{
 		var result = PulsarTransformEngine.ProcessWithPlans(channelBuffers[channel], planners[channel]);
-		processedChannels[channel] = result.Output;
-		allocations[channel] = allocator.AllocateSong(result.Plans);
+		var psycho = new PulsarPsycho(new PulsarPsychoSettings
+		{
+			SampleRate = sampleRate,
+			FftSize = 2048,
+			HopSize = PulsarBlockLadder.ControlHopSize,
+		});
+		var psychoFrames = psycho.AnalyzeSong(channelBuffers[channel]);
+		allocations[channel] = allocator.AllocateSong(result.Plans, psychoFrames);
+		processedChannels[channel] = PulsarTransformEngine.ProcessWithBitAllocation(
+			channelBuffers[channel],
+			result.Plans,
+			allocations[channel],
+			psychoFrames);
 	});
 
 	var output = new float[interleavedSamples.Length];
+	if (useMidSideStereo && channels == 2)
+	{
+		for (int frame = 0; frame < frames; frame++)
+		{
+			float mid = processedChannels[0][frame];
+			float side = processedChannels[1][frame];
+			output[frame * channels] = mid + side;
+			output[(frame * channels) + 1] = mid - side;
+		}
+
+		return (output, planners, allocations);
+	}
+
 	for (int channel = 0; channel < channels; channel++)
 	{
 		float[] processedChannel = processedChannels[channel];
@@ -259,6 +510,22 @@ static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>
 	}
 
 	return (output, planners, allocations);
+}
+
+static void ApplyMidSideStereo(float[] left, float[] right)
+{
+	if (left.Length != right.Length)
+	{
+		throw new InvalidOperationException("Mid/Side stereo requires matching channel lengths.");
+	}
+
+	for (int i = 0; i < left.Length; i++)
+	{
+		float l = left[i];
+		float r = right[i];
+		left[i] = 0.5f * (l + r);
+		right[i] = 0.5f * (l - r);
+	}
 }
 
 static float[] ProcessLegacy(float[] interleavedSamples, int channels, int blockSize)
@@ -431,6 +698,23 @@ static void WritePlannerLogs(string outputPath, int sampleRate, IReadOnlyList<Pu
 
 static void WriteAllocationLogs(string outputPath, int sampleRate, IReadOnlyList<List<PulsarFrameAllocation>> allocationsByChannel, int targetKbps)
 {
+    long totalAllocatedBits = 0;
+    int maxSegmentCount = 0;
+
+    foreach (var allocations in allocationsByChannel)
+    {
+        maxSegmentCount = Math.Max(maxSegmentCount, allocations.Count);
+        foreach (PulsarFrameAllocation allocation in allocations)
+        {
+            totalAllocatedBits += allocation.TargetBits;
+        }
+    }
+
+    double totalDurationSeconds = maxSegmentCount * (double)PulsarBlockLadder.ControlHopSize / sampleRate;
+    double actualAverageKbps = totalDurationSeconds > 0.0
+        ? totalAllocatedBits / totalDurationSeconds / 1000.0
+        : 0.0;
+
     string logPath = Path.Combine(
         Path.GetDirectoryName(outputPath)!,
         $"{Path.GetFileNameWithoutExtension(outputPath)}.allocation.log.txt");
@@ -439,6 +723,8 @@ static void WriteAllocationLogs(string outputPath, int sampleRate, IReadOnlyList
     writer.WriteLine($"Pulsar allocation log for {Path.GetFileName(outputPath)}");
     writer.WriteLine($"SampleRate={sampleRate}");
     writer.WriteLine($"TargetKbps={targetKbps}");
+    writer.WriteLine($"AllocatedBits={totalAllocatedBits}");
+    writer.WriteLine($"ActualAverageKbps={FormatDouble(actualAverageKbps)}");
     writer.WriteLine($"ControlHopSize={PulsarBlockLadder.ControlHopSize}");
     writer.WriteLine($"SegmentDurationSeconds={FormatDouble((double)PulsarBlockLadder.ControlHopSize / sampleRate)}");
 
@@ -494,7 +780,10 @@ static void PrintUsage()
 {
     Console.WriteLine("Usage:");
     Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- <input.wav> <output.wav>");
-    Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- --vbr <kbps> <input.wav> <output.wav>");
+    Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- -V <0-9> --vbr <input.wav> <output.wav>");
+    Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- -V <0-9> --vbrplsr <input.wav> <output.pulsr> <decoded.wav>");
+    Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- -V <0-9> --vbrplsrpcm <input.wav> <output.pulsr>");
+    Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- --decodeplsr <input.pulsr> <output.wav>");
     Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- --legacy <input.wav> <output.wav> [blockSize]");
     Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- --legacyP <input.wav> <output.wav>");
     Console.WriteLine("  dotnet run --project .\\PulsarCodec.csproj -- --legacyP-fast <input.wav> <output.wav>");
@@ -502,7 +791,14 @@ static void PrintUsage()
     Console.WriteLine();
     Console.WriteLine("Legacy mode renders a fixed stationary path without using the planner.");
     Console.WriteLine("LegacyP mode renders using the planner decisions, but without planner switching blending.");
+    Console.WriteLine("-V 0 = beste Qualitaet, -V 9 = staerkste Kompression.");
     Console.WriteLine("Valid block sizes: " + string.Join(", ", PulsarBlockLadder.Steps));
+}
+
+static int QualityToNominalKbps(int quality)
+{
+    int[] nominalKbps = [320, 288, 256, 224, 192, 160, 128, 112, 96, 80];
+    return nominalKbps[Math.Clamp(quality, 0, nominalKbps.Length - 1)];
 }
 
 static void WriteResidualComparison(string originalPath, string processedPath)
@@ -519,17 +815,21 @@ static void WriteResidualComparison(string originalPath, string processedPath)
         return;
     }
 
-    using var originalReader = new AudioFileReader(originalPath);
-    using var processedReader = new AudioFileReader(processedPath);
+    var originalReader = ReadAudioFile(originalPath);
+    var processedReader = ReadAudioFile(processedPath);
 
-    if (!originalReader.WaveFormat.Equals(processedReader.WaveFormat))
+    if (originalReader.WaveFormat.Channels != processedReader.WaveFormat.Channels)
     {
-        Console.Error.WriteLine("WAV formats do not match. Skipping residual comparison.");
+        Console.Error.WriteLine("Channel count does not match. Skipping residual comparison.");
         return;
     }
 
-    var originalSamples = ReadAllSamples(originalReader);
-    var processedSamples = ReadAllSamples(processedReader);
+    var originalSamples = ResampleInterleaved(
+        originalReader.Samples,
+        originalReader.WaveFormat.Channels,
+        originalReader.WaveFormat.SampleRate,
+        processedReader.WaveFormat.SampleRate);
+    var processedSamples = processedReader.Samples;
 
     if (originalSamples.Length != processedSamples.Length)
     {
@@ -577,8 +877,8 @@ static void WriteResidualComparison(string originalPath, string processedPath)
         summary.WriteLine($"Original: {Path.GetFileName(originalPath)}");
         summary.WriteLine($"Processed: {Path.GetFileName(processedPath)}");
         summary.WriteLine($"Residual: {Path.GetFileName(residualPath)}");
-        summary.WriteLine($"SampleRate: {originalReader.WaveFormat.SampleRate}");
-        summary.WriteLine($"Channels: {originalReader.WaveFormat.Channels}");
+        summary.WriteLine($"SampleRate: {processedReader.WaveFormat.SampleRate}");
+        summary.WriteLine($"Channels: {processedReader.WaveFormat.Channels}");
         summary.WriteLine($"TotalSamples: {originalSamples.Length}");
         summary.WriteLine($"RMS Original: {FormatDouble(rmsOriginal)}");
         summary.WriteLine($"RMS Processed: {FormatDouble(rmsProcessed)}");
@@ -605,17 +905,21 @@ static void CompareWavs(string originalPath, string processedPath)
         Environment.Exit(1);
     }
 
-    using var originalReader = new AudioFileReader(originalPath);
-    using var processedReader = new AudioFileReader(processedPath);
+    var originalReader = ReadAudioFile(originalPath);
+    var processedReader = ReadAudioFile(processedPath);
 
-    if (!originalReader.WaveFormat.Equals(processedReader.WaveFormat))
+    if (originalReader.WaveFormat.Channels != processedReader.WaveFormat.Channels)
     {
-        Console.Error.WriteLine("WAV formats do not match. Comparison requires identical sample rate, channels and bit depth.");
+        Console.Error.WriteLine("WAV channel count does not match. Comparison requires identical channel count.");
         Environment.Exit(1);
     }
 
-    var originalSamples = ReadAllSamples(originalReader);
-    var processedSamples = ReadAllSamples(processedReader);
+    var originalSamples = ResampleInterleaved(
+        originalReader.Samples,
+        originalReader.WaveFormat.Channels,
+        originalReader.WaveFormat.SampleRate,
+        processedReader.WaveFormat.SampleRate);
+    var processedSamples = processedReader.Samples;
 
     if (originalSamples.Length != processedSamples.Length)
     {
@@ -664,8 +968,8 @@ static void CompareWavs(string originalPath, string processedPath)
         summary.WriteLine($"Original: {Path.GetFileName(originalPath)}");
         summary.WriteLine($"Processed: {Path.GetFileName(processedPath)}");
         summary.WriteLine($"Residual: {Path.GetFileName(residualPath)}");
-        summary.WriteLine($"SampleRate: {originalReader.WaveFormat.SampleRate}");
-        summary.WriteLine($"Channels: {originalReader.WaveFormat.Channels}");
+        summary.WriteLine($"SampleRate: {processedReader.WaveFormat.SampleRate}");
+        summary.WriteLine($"Channels: {processedReader.WaveFormat.Channels}");
         summary.WriteLine($"TotalSamples: {originalSamples.Length}");
         summary.WriteLine($"RMS Original: {FormatDouble(rmsOriginal)}");
         summary.WriteLine($"RMS Processed: {FormatDouble(rmsProcessed)}");

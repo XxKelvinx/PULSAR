@@ -1,207 +1,230 @@
 using System;
 using System.Collections.Generic;
+using Pulsar.Psycho;
 
 public sealed class PulsarAllocationConfig
 {
-	public int TargetKbps { get; init; } = 128;
-	public int MinKbps { get; init; } = 64;
-	public int MaxKbps { get; init; } = 512;
-	public int SampleRate { get; init; } = 44100;
-	public int HopSize { get; init; } = PulsarBlockLadder.ControlHopSize;
-	public double MetadataFloorRatio { get; init; } = 0.10;
-	public double MetadataCeilingRatio { get; init; } = 0.20;
-	public int MinBitsPerFrame { get; init; } = 48;
-	public int MaxBitsPerFrame { get; init; } = 1536;
+    // TRUE VBR: Wir nutzen Qualitätsstufen (0 bis 9) statt TargetKbps!
+    // 9 = Best (Gottmodus/Transparent), 5 = Normal, 0 = Worst (Starke Kompression)
+    public int Quality { get; init; } = 4; 
+
+    public int SampleRate { get; init; } = 44100;
+    public int HopSize { get; init; } = PulsarBlockLadder.ControlHopSize;
+    
+    // Adaptive Floor Limits
+    public double MaxBandFloorBitsRatio { get; init; } = 0.25;
+    public double MinBandFloorBitsRatio { get; init; } = 0.02;
+
+    public double PerceptualEntropyWeight { get; init; } = 0.85;
+    public double SmrWeight { get; init; } = 0.70;
+    public double MaskingPressureWeight { get; init; } = 0.55;
+    public double TransientBoostWeight { get; init; } = 0.25;
+    public double BassProtectionWeight { get; init; } = 0.40;
+    public double TonalProtectionWeight { get; init; } = 0.22;
+    public double LowBandProtectionBoost { get; init; } = 0.35;
+    public double HighBandTransientBoost { get; init; } = 0.22;
+    public float BassProtectionEndHz { get; init; } = 260.0f;
+    public float HighBandTransientStartHz { get; init; } = 4000.0f;
+
+    public double BaseFrameDemand { get; init; } = 0.10;
+    public double MinFrameDemand { get; init; } = 0.10;
 }
 
 public sealed class PulsarFrameAllocation
 {
-	public required int TargetBits { get; init; }
-	public required int MetadataBits { get; init; }
-	public required int BlockBits { get; init; }
-	public required double MetadataRatio { get; init; }
-	public required int[] BandBits { get; init; }
-	public required double ComplexityWeight { get; init; }
+    public required int TargetBits { get; init; } // Wird in TrueVBR ignoriert, bleibt für API-Kompatibilität
+    public required int MetadataBits { get; init; }
+    public required int BlockBits { get; init; }
+    public required double MetadataRatio { get; init; }
+    public required int[] BandBits { get; init; }
+    public required double ComplexityWeight { get; init; }
+}
+
+public sealed class PulsarRateControlResult
+{
+    public required int FinalGlobalGain { get; init; }
+    public required int EstimatedBits { get; init; } // In TrueVBR immer 0 (irrelevant)
+    public required int TargetBits { get; init; }    // In TrueVBR immer 0 (irrelevant)
+    public required bool BudgetMet { get; init; }    // In TrueVBR immer true
+    public required PulsarQuantizedSpectrum QuantizedSpectrum { get; init; }
 }
 
 public sealed class PulsarAllocator
 {
-	private readonly PulsarAllocationConfig _config;
+    private readonly PulsarAllocationConfig _config;
+    private readonly PulsarDemandModel _demandModel;
 
-	public PulsarAllocator(PulsarAllocationConfig? config = null)
-	{
-		_config = config ?? new PulsarAllocationConfig();
-	}
+    // LAME-Style BaseGains für V0 bis V9
+    // Q9 = Gain 10 (Fast verlustfrei), Q0 = Gain 400 (sehr lo-fi)
+    private static readonly int[] QualityBaseGains = { 10, 30, 60, 100, 150, 200, 250, 300, 350, 400 };
 
-	public List<PulsarFrameAllocation> AllocateSong(IReadOnlyList<PulsarFramePlan> framePlans)
-	{
-		ArgumentNullException.ThrowIfNull(framePlans);
+    public PulsarAllocator(PulsarAllocationConfig? config = null)
+    {
+        _config = config ?? new PulsarAllocationConfig();
+        _demandModel = new PulsarDemandModel(_config);
+    }
 
-		var allocations = new List<PulsarFrameAllocation>(framePlans.Count);
-		if (framePlans.Count == 0)
-		{
-			return allocations;
-		}
+    public List<PulsarFrameAllocation> AllocateSong(
+        IReadOnlyList<PulsarFramePlan> framePlans,
+        IReadOnlyList<PulsarPsychoResult> psychoFrames)
+    {
+        ArgumentNullException.ThrowIfNull(framePlans);
+        ArgumentNullException.ThrowIfNull(psychoFrames);
 
-		double effectiveKbps = Math.Clamp(_config.TargetKbps, _config.MinKbps, _config.MaxKbps);
-		double frameSeconds = _config.HopSize / (double)_config.SampleRate;
-		double totalBitBudget = effectiveKbps * 1000.0 * frameSeconds * framePlans.Count;
-		var weights = new double[framePlans.Count];
-		double weightSum = 0.0;
+        var allocations = new List<PulsarFrameAllocation>(framePlans.Count);
+        if (framePlans.Count == 0) return allocations;
 
-		for (int index = 0; index < framePlans.Count; index++)
-		{
-			weights[index] = ComputeFrameComplexityWeight(framePlans[index]);
-			weightSum += weights[index];
-		}
+        PulsarDemandAnalysis demandAnalysis = _demandModel.Analyze(framePlans, psychoFrames);
 
-		if (weightSum <= 0.0)
-		{
-			weightSum = framePlans.Count;
-			for (int index = 0; index < framePlans.Count; index++)
-			{
-				weights[index] = 1.0;
-			}
-		}
+        // TRUE VBR: Kein globales Budget mehr! 
+        // Wir bestimmen die "Dummy"-Bits für den Quantizer rein aus dem Quality-Level.
+        int qualityLevel = Math.Clamp(_config.Quality, 0, 9);
+        int nominalBitsPerFrame = Math.Max(320, 1850 - (qualityLevel * 150)); 
 
-		int targetBudget = Math.Clamp((int)Math.Round(totalBitBudget), _config.MinBitsPerFrame * framePlans.Count, _config.MaxBitsPerFrame * framePlans.Count);
-		int accumulatedBits = 0;
+        for (int index = 0; index < framePlans.Count; index++)
+        {
+            PulsarFrameDemand demandFrame = demandAnalysis.Frames[index];
+            
+            // Wir verteilen fiktive BandBits basierend auf dem Demand, damit 
+            // die 'effectiveDensity' in deinem Quantizer korrekt arbeiten kann.
+            int[] bandBits = AllocateBandBits(demandFrame, nominalBitsPerFrame);
 
-		for (int index = 0; index < framePlans.Count; index++)
-		{
-			PulsarFramePlan plan = framePlans[index];
-			double idealBits = totalBitBudget * weights[index] / weightSum;
-			int targetBits = Math.Clamp((int)Math.Round(idealBits), _config.MinBitsPerFrame, _config.MaxBitsPerFrame);
+            allocations.Add(new PulsarFrameAllocation
+            {
+                TargetBits = 0,     // Abgeschafft
+                MetadataBits = 0,   // Abgeschafft (Der RangeCoder schreibt, was er braucht)
+                BlockBits = 0,      // Abgeschafft
+                MetadataRatio = 0,
+                BandBits = bandBits,
+                ComplexityWeight = demandFrame.FrameDemand,
+            });
+        }
 
-			int metadataBits = Math.Max(16, (int)Math.Round(targetBits * ComputeMetadataRatio(plan)));
-			int blockBits = Math.Max(0, targetBits - metadataBits);
-			int[] bandBits = AllocateBandBits(plan, blockBits);
+        return allocations;
+    }
 
-			allocations.Add(new PulsarFrameAllocation
-			{
-				TargetBits = targetBits,
-				MetadataBits = metadataBits,
-				BlockBits = blockBits,
-				MetadataRatio = metadataBits / (double)Math.Max(1, targetBits),
-				BandBits = bandBits,
-				ComplexityWeight = weights[index],
-			});
+    /// <summary>
+    /// TRUE VBR (Constant Quality) Quantisierung.
+    /// Ersetzt die alte Binary-Search. Nutzt Ogg Vorbis/LAME Logik.
+    /// </summary>
+    public PulsarRateControlResult QuantizeFrameVbr(
+        float[] mdctSpectrum,
+        int[] bandBits,
+        PulsarPsychoResult psycho,
+        int ignoredTargetBits,     // Wird ignoriert! API bleibt für deinen Packer intakt.
+        PulsarFrameDemand demand)  // NEU: Wir brauchen den Demand für die PE-Modulation!
+    {
+        ArgumentNullException.ThrowIfNull(mdctSpectrum);
+        ArgumentNullException.ThrowIfNull(bandBits);
+        ArgumentNullException.ThrowIfNull(psycho);
 
-			accumulatedBits += targetBits;
-		}
+        // 1. Basis-Gain für das gewählte Quality-Level (0-9)
+        int qualityLevel = Math.Clamp(_config.Quality, 0, 9);
+        int baseGain = QualityBaseGains[qualityLevel];
 
-		return allocations;
-	}
+        // 2. Perceptual Entropy (PE) Modulation
+        // Hochkomplexe Frames (Transienten) senken den Gain -> mehr Präzision
+        double peModulation = (demand.PePressure - 0.5) * 100.0;
+        int frameGain = baseGain - (int)Math.Round(peModulation);
 
-	private double ComputeFrameComplexityWeight(PulsarFramePlan framePlan)
-	{
-		double weight = 1.0;
-		weight += framePlan.TransientLevel switch
-		{
-			PulsarTransientLevel.Hard => 0.38,
-			PulsarTransientLevel.Soft => 0.18,
-			_ => 0.00,
-		};
+        // 3. Stille- und Noise-Floor-Erkennung (Bit-Saver)
+        if (psycho.TotalEnergyDb < -48.0f)
+        {
+            frameGain += 120; // Ruhige Frames dürfen gröber quantisiert werden
+        }
 
-		weight += Math.Clamp(framePlan.AttackRatio / 12.0, 0.0, 0.35);
-		weight += Math.Clamp(framePlan.CrestFactor / 10.0, 0.0, 0.24);
-		weight += Math.Clamp(framePlan.EnergyModulation / 0.90, 0.0, 0.20);
-		weight += Math.Clamp(framePlan.HighBandRatio / 0.45, 0.0, 0.22);
-		weight += Math.Clamp(framePlan.LowBandRatio / 0.40, 0.0, 0.14);
-		weight += Math.Clamp(framePlan.SustainedHighBandRatio / 0.30, 0.0, 0.10);
+        // 4. Grenzen setzen (Gottmodus 0 bis Trash 550)
+        frameGain = Math.Clamp(frameGain, 0, 550);
 
-		if (framePlan.BlockSize < PulsarBlockLadder.DefaultBlockSize)
-		{
-			weight *= 1.05;
-		}
-		else if (framePlan.BlockSize > PulsarBlockLadder.DefaultBlockSize)
-		{
-			weight *= 0.95;
-		}
+        // 5. One-Shot Quantisierung (Keine while-Schleife mehr!)
+        var bestQuantized = PulsarQuantizer.QuantizeSpectrumDetailed(mdctSpectrum, bandBits, psycho, frameGain);
 
-		return Math.Clamp(weight, 0.7, 2.6);
-	}
+        return new PulsarRateControlResult
+        {
+            FinalGlobalGain = frameGain,
+            EstimatedBits = 0, // Weg mit dem Lügen-Estimator!
+            TargetBits = 0,
+            BudgetMet = true,
+            QuantizedSpectrum = bestQuantized,
+        };
+    }
 
-	private double ComputeMetadataRatio(PulsarFramePlan framePlan)
-	{
-		double ratio = _config.MetadataFloorRatio;
-		ratio += framePlan.TransientLevel switch
-		{
-			PulsarTransientLevel.Hard => 0.04,
-			PulsarTransientLevel.Soft => 0.02,
-			_ => 0.00,
-		};
-		ratio += framePlan.BlockSize switch
-		{
-			<= 512 => -0.01,
-			>= 2048 => 0.02,
-			_ => 0.00,
-		};
-		ratio += Math.Clamp(framePlan.AttackRatio / 40.0, 0.0, 0.03);
-		return Math.Clamp(ratio, _config.MetadataFloorRatio, _config.MetadataCeilingRatio);
-	}
+    private int[] AllocateBandBits(PulsarFrameDemand demandFrame, int nominalBlockBits)
+    {
+        int bandCount = demandFrame.BandDemands.Length;
+        if (bandCount <= 0) return Array.Empty<int>();
 
-	private int[] AllocateBandBits(PulsarFramePlan framePlan, int blockBits)
-	{
-		int bandCount = framePlan.BandCount;
-		if (bandCount <= 0 || blockBits <= 0)
-		{
-			return Array.Empty<int>();
-		}
+        int[] bandBits = new int[bandCount];
+        int assigned = 0;
 
-		var bandWeights = new double[bandCount];
-		double totalWeight = 0.0;
-		double highRatio = framePlan.HighBandRatio;
-		double lowRatio = framePlan.LowBandRatio;
-		double transientFactor = framePlan.TransientLevel switch
-		{
-			PulsarTransientLevel.Hard => 1.0,
-			PulsarTransientLevel.Soft => 0.6,
-			_ => 0.2,
-		};
-		double dynamicFactor = Math.Clamp(framePlan.CrestFactor / 8.0 + framePlan.EnergyModulation / 2.0, 0.0, 1.0);
+        // Fiktive Verteilung der Bits basierend auf SMR (BandDemands)
+        for (int i = 0; i < bandCount; i++)
+        {
+            int share = (int)Math.Floor(nominalBlockBits * demandFrame.BandDemands[i]);
+            bandBits[i] = Math.Max(2, share); // Jedes Band bekommt mindestens 2 Dummy-Bits, damit es aktiv bleibt
+            assigned += bandBits[i];
+        }
 
-		for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
-		{
-			double position = bandCount == 1 ? 0.0 : (double)bandIndex / (bandCount - 1);
-			double lowShape = 1.0 - position;
-			double highShape = position;
-			double bandWeight = 1.0;
-			bandWeight += lowShape * lowRatio * 2.5;
-			bandWeight += highShape * highRatio * 2.0;
-			bandWeight += (0.5 + position) * transientFactor * 0.8;
-			bandWeight += (0.65 + 0.45 * Math.Cos(Math.PI * (position - 0.5))) * dynamicFactor * 0.65;
-			bandWeights[bandIndex] = Math.Max(0.05, bandWeight);
-			totalWeight += bandWeights[bandIndex];
-		}
+        return bandBits;
+    }
 
-		int[] bandBits = new int[bandCount];
-		int assigned = 0;
-		for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
-		{
-			bandBits[bandIndex] = (int)Math.Floor(blockBits * bandWeights[bandIndex] / totalWeight);
-			assigned += bandBits[bandIndex];
-		}
+    public int EstimateEntropyBits(int[] quantizedData)
+    {
+        ArgumentNullException.ThrowIfNull(quantizedData);
 
-		int remaining = blockBits - assigned;
-		while (remaining > 0)
-		{
-			int bestBand = 0;
-			double bestScore = double.NegativeInfinity;
-			for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
-			{
-				double score = bandWeights[bandIndex] / (bandBits[bandIndex] + 1);
-				if (score > bestScore)
-				{
-					bestScore = score;
-					bestBand = bandIndex;
-				}
-			}
-			bandBits[bestBand]++;
-			remaining--;
-		}
+        int bits = 0;
+        int cursor = 0;
+        while (cursor < quantizedData.Length)
+        {
+            if (quantizedData[cursor] == 0)
+            {
+                int runStart = cursor;
+                while (cursor < quantizedData.Length && quantizedData[cursor] == 0)
+                {
+                    cursor++;
+                }
 
-		return bandBits;
-	}
+                int runLength = cursor - runStart;
+                bits += 2 + EstimateZeroRunBits(runLength);
+                continue;
+            }
 
+            int magnitude = Math.Abs(quantizedData[cursor]);
+            bits += 2 + EstimateMagnitudeBits(magnitude) + 1;
+            cursor++;
+        }
+
+        return bits;
+    }
+
+    private static int EstimateZeroRunBits(int runLength)
+    {
+        if (runLength <= 1) return 1;
+        if (runLength <= 3) return 3;
+        if (runLength <= 7) return 5;
+        if (runLength <= 15) return 7;
+        return 10 + ILog((uint)Math.Max(1, runLength - 16));
+    }
+
+    private static int EstimateMagnitudeBits(int magnitude)
+    {
+        if (magnitude <= 1) return 1;
+        if (magnitude == 2) return 2;
+        if (magnitude <= 4) return 3;
+        if (magnitude <= 8) return 4;
+        if (magnitude <= 16) return 5;
+        return 6 + ILog((uint)Math.Max(1, magnitude - 17));
+    }
+
+    private static int ILog(uint value)
+    {
+        int bits = 0;
+        while (value > 0)
+        {
+            value >>= 1;
+            bits++;
+        }
+
+        return bits;
+    }
 }

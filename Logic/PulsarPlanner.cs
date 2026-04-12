@@ -161,6 +161,18 @@ public sealed class PulsarPlannerSettings
     // ── Pre-echo lookahead ──
     public int PreEchoLookahead { get; init; } = 3;
     public double PreEchoThreshold { get; init; } = 0.55;
+    public double ContextSplitPenalty { get; init; } = 0.16;
+    public double ContextBlock256Penalty { get; init; } = 0.40;
+    public double ContextBlock512Penalty { get; init; } = 0.10;
+    public double ContextUnjustifiedSmallBlockPenalty { get; init; } = 1.10;
+    public double ContextOverfragmentPenalty { get; init; } = 0.55;
+    public double ContextPreferred2048Bonus { get; init; } = -0.18;
+    public double ContextAttack256Bonus { get; init; } = -0.75;
+    public double ContextAttack512Bonus { get; init; } = -0.22;
+    public double ContextAttackMissPenalty { get; init; } = 1.15;
+    public double LargeBlock4096PromotionThreshold { get; init; } = 3.75;
+    public double LargeBlock8192PromotionThreshold { get; init; } = 4.55;
+    public double LargeBlock16384PromotionThreshold { get; init; } = 5.40;
 }
 
 internal readonly record struct SegmentAnalysisData(
@@ -196,6 +208,10 @@ public sealed class PulsarPlanner
     private static readonly int DefaultStateIndex = Array.IndexOf(BlockSteps, PulsarBlockLadder.DefaultBlockSize);
     private static readonly int ContextSegmentCount = PulsarBlockLadder.DefaultBlockSize / PulsarBlockLadder.ControlHopSize;
     private static readonly int[] ContextEligibleStates = { 0, 1, 2, 3 };
+    private static readonly int[] LargeBlockPromotionStates = { 6, 5, 4 };
+    private static readonly double[] TransientStateBias = { -0.58, -0.24, 0.08, 0.42, 0.78, 1.02, 1.18 };
+    private static readonly double[] BassStateBias = { 0.60, 0.28, 0.04, -0.24, -0.46, -0.62, -0.72 };
+    private static readonly double[] CalmStateBias = { 0.18, 0.08, 0.00, -0.09, -0.16, -0.22, -0.26 };
 
     private readonly PulsarPlannerSettings _settings;
     private readonly PulsarTransientDetector _transientDetector = new();
@@ -218,6 +234,50 @@ public sealed class PulsarPlanner
     private const double BassHeavyRatio = 0.18;
     private const double BrightHighBand = 0.16;
     private const double VeryBrightHighBand = 0.24;
+
+    // —— Planner tuning knobs: transient sensitivity / recovery / large-block regain ——
+    private const double OpusTransientSoftThreshold = 0.24;
+    private const double OpusTransientHardThreshold = 0.60;
+    private const double OpusTransientOnsetCenter = 0.38;
+    private const double OpusTransientOnsetRange = 0.38;
+    private const double TransientFluxCenter = 0.12;
+    private const double TransientFluxRange = 0.34;
+    private const double TransientRatioCenter = 6.0;
+    private const double TransientRatioRange = 7.0;
+    private const double TransientModulationCenter = 0.09;
+    private const double TransientModulationRange = 0.24;
+    private const double TransientCrestCenter = 1.8;
+    private const double TransientCrestRange = 1.8;
+    private const double TransientBrightnessCenter = 0.015;
+    private const double TransientBrightnessRange = 0.10;
+    private const double OpusWeakTransientPenalty = 0.10;
+    private const double OpusEarlyFluxBonus = 0.18;
+    private const double OpusEarlyFluxTrigger = 0.48;
+
+    private const double ShortBurstTrigger = 0.74;
+    private const double ShortBurst256Trigger = 0.90;
+    private const double ShortBurstPreEchoTrigger = 0.42;
+    private const double ShortBurstFluxTrigger = 0.22;
+    private const double ShortBurstAttackRatioTrigger = 9.0;
+
+    private const double LateBurstTrigger = 0.62;
+    private const double LateBurstAttackRatioTrigger = 8.5;
+    private const double LateBurstFluxTrigger = 0.14;
+    private const double LateBurstPreEchoTrigger = 0.30;
+
+    private const double RecoveryStopTransientNeed = 0.42;
+    private const double RecoveryBass2048Threshold = 0.58;
+    private const double RecoveryBass4096Threshold = 0.82;
+
+    private const double GapRecoveryTransientCeiling = 0.26;
+    private const double GapRecoveryFluxCeiling = 0.18;
+    private const double GapRecoveryPreEchoCeiling = 0.22;
+    private const double GapRecovery2048BassThreshold = 0.52;
+    private const double GapRecovery4096BassThreshold = 0.78;
+
+    private const double ClampTransientFloor = 0.30;
+    private const double Clamp2048BassThreshold = 0.82;
+    private const double Clamp2048TransientCeiling = 0.24;
 
     // ── Spectral band cutoff bins (approximate for 44100 Hz, 512-sample DFT) ──
     // We compute these relative to the analysis frame length at runtime.
@@ -375,10 +435,6 @@ public sealed class PulsarPlanner
             allowWeakTransients: true, out bool weakTransient,
             toneFreq: 0.0f, toneishness: 0.0f);
 
-        var level = PulsarTransientLevel.None;
-        if (isTransient)
-            level = tfEstimate >= 0.55f ? PulsarTransientLevel.Hard : PulsarTransientLevel.Soft;
-
         double attackRatio = tfEstimate * 12.0;
         double peakDeltaDb = tfEstimate * 20.0;
         int attackIndex = tfEstimate switch
@@ -400,6 +456,18 @@ public sealed class PulsarPlanner
             out SpectralProfile spectral, out double spectralFlux);
 
         double sustainedHighBandRatio = highBandRatio;
+        var level = ClassifyTransientLevel(
+            isTransient,
+            weakTransient,
+            tfEstimate,
+            attackRatio,
+            attackIndex,
+            energyModulation,
+            crestFactor,
+            highBandRatio,
+            sustainedHighBandRatio,
+            spectral,
+            spectralFlux);
 
         double desiredPosition = SelectDesiredPosition(
             level, attackRatio, attackIndex,
@@ -446,10 +514,6 @@ public sealed class PulsarPlanner
             allowWeakTransients: true, out bool weakTransient,
             toneFreq: 0.0f, toneishness: 0.0f);
 
-        var level = PulsarTransientLevel.None;
-        if (isTransient)
-            level = tfEstimate >= 0.55f ? PulsarTransientLevel.Hard : PulsarTransientLevel.Soft;
-
         double attackRatio = tfEstimate * 12.0;
         double peakDeltaDb = tfEstimate * 20.0;
         int attackIndex = tfEstimate switch
@@ -467,8 +531,20 @@ public sealed class PulsarPlanner
 
         if (_settings.UseFastAnalysis)
         {
+            var fastLevel = ClassifyTransientLevel(
+                isTransient,
+                weakTransient,
+                tfEstimate,
+                attackRatio,
+                attackIndex,
+                energyModulation,
+                crestFactor,
+                highBandRatio,
+                highBandRatio,
+                new SpectralProfile(),
+                0.0);
             return new SegmentAnalysisData(
-                level,
+                fastLevel,
                 attackRatio,
                 peakDeltaDb,
                 attackIndex,
@@ -481,6 +557,18 @@ public sealed class PulsarPlanner
         }
 
         ComputeSpectralProfile(samples, fftReal, fftImag, magnitudeBuffer, analysisWindow, out SpectralProfile spectral);
+        var level = ClassifyTransientLevel(
+            isTransient,
+            weakTransient,
+            tfEstimate,
+            attackRatio,
+            attackIndex,
+            energyModulation,
+            crestFactor,
+            highBandRatio,
+            highBandRatio,
+            spectral,
+            0.0);
 
         return new SegmentAnalysisData(
             level,
@@ -923,97 +1011,88 @@ public sealed class PulsarPlanner
         double highBandRatio, double sustainedHighBandRatio,
         SpectralProfile spectral, double spectralFlux)
     {
-        // State indices: 0=256, 1=512, 2=1024, 3=2048, 4=4096, 5=8192, 6=16384
-        int maxIdx = StateCount - 1;    // 6 = 16384
-        int largeIdx = maxIdx;          // 6
-        int secLargeIdx = maxIdx - 1;   // 5
-        int midIdx = maxIdx / 2;        // 3 = 2048
-        int smIdx = 1;                  // 512
-
-        // ── Hard transient: go small ──
-        if (level == PulsarTransientLevel.Hard)
+        double classWeight = level switch
         {
-            bool extreme = IsExtremeHard(attackRatio, energyModulation, crestFactor);
-            double basePos = extreme ? 0.0 : smIdx;
+            PulsarTransientLevel.Hard => 1.0,
+            PulsarTransientLevel.Soft => 0.55,
+            _ => 0.0,
+        };
+        double attackLead = attackIndex switch
+        {
+            <= 0 => 1.0,
+            1 => 0.92,
+            2 => 0.80,
+            3 => 0.64,
+            4 => 0.48,
+            _ => 0.30,
+        };
 
-            // With high spectral flux, even more urgency to shrink
-            if (spectralFlux > 0.5)
-                basePos = Math.Min(basePos, 0.5);
+        double fluxNeed = Math.Clamp((spectralFlux - 0.18) / 0.44, 0.0, 1.0);
+        double ratioNeed = Math.Clamp((attackRatio - 3.2) / 8.8, 0.0, 1.0);
+        double crestNeed = Math.Clamp((crestFactor - 1.55) / 2.00, 0.0, 1.0);
+        double brightnessNeed = Math.Clamp((highBandRatio - 0.018) / 0.13, 0.0, 1.0);
+        double transientNeed = (0.34 * classWeight * attackLead)
+            + (0.24 * fluxNeed)
+            + (0.18 * ratioNeed)
+            + (0.10 * crestNeed)
+            + (0.14 * brightnessNeed);
+        transientNeed = Math.Clamp(transientNeed, 0.0, 1.0);
 
-            return ApplyAttackLead(level, basePos, attackIndex);
+        double bassNeed = Math.Clamp(
+            (spectral.SubBass * 1.45)
+            + (spectral.Bass * 1.15)
+            + (spectral.LowMid * 0.40),
+            0.0,
+            1.45);
+        double tonalNeed = Math.Clamp((0.68 - spectral.Flatness) / 0.68, 0.0, 1.0);
+        double calmNeed = Math.Clamp((0.28 - energyModulation) / 0.28, 0.0, 1.0);
+        double darkNeed = Math.Clamp((0.055 - highBandRatio) / 0.055, 0.0, 1.0);
+        double stableNeed = Math.Clamp(
+            (0.46 * Math.Clamp(bassNeed, 0.0, 1.0))
+            + (0.22 * tonalNeed)
+            + (0.18 * calmNeed)
+            + (0.14 * darkNeed),
+            0.0,
+            1.0);
+
+        double sustainedBrightnessPenalty = Math.Clamp((sustainedHighBandRatio - 0.030) / 0.16, 0.0, 1.0);
+        double basePosition = 3.0
+            + (stableNeed * 2.75)
+            - (transientNeed * 3.45)
+            - (sustainedBrightnessPenalty * 0.60);
+
+        if (transientNeed >= 0.88)
+        {
+            basePosition = Math.Min(basePosition, attackIndex <= 1 ? 0.15 : 0.85);
+        }
+        else if (transientNeed >= 0.72)
+        {
+            basePosition = Math.Min(basePosition, attackIndex <= 2 ? 1.05 : 1.70);
+        }
+        else if (transientNeed >= 0.54)
+        {
+            basePosition = Math.Min(basePosition, 2.25);
         }
 
-        // ── Soft transient ──
-        if (level == PulsarTransientLevel.Soft)
+        if (stableNeed >= 0.92 && transientNeed <= 0.18)
         {
-            double basePos = 2.0; // 1024
-            if (spectralFlux > 0.4)
-                basePos = 1.5;
-            return ApplyAttackLead(level, basePos, attackIndex);
+            basePosition = Math.Max(basePosition, 5.55);
+        }
+        else if (stableNeed >= 0.76 && transientNeed <= 0.28)
+        {
+            basePosition = Math.Max(basePosition, 4.20);
+        }
+        else if (stableNeed >= 0.56 && transientNeed <= 0.36)
+        {
+            basePosition = Math.Max(basePosition, 3.10);
         }
 
-        // ── Very busy: modulation + high flux ──
-        if (energyModulation >= VeryBusyModulation)
-            return smIdx;
-
-        if (energyModulation >= BusyModulation)
+        if (spectralFlux <= 0.08 && energyModulation <= 0.10 && bassNeed >= 0.78)
         {
-            // Busy but not transient: 1024–2048 range
-            if (spectral.Centroid > 0.5)
-                return 2.0;
-            return midIdx;
+            basePosition = Math.Max(basePosition, 5.10);
         }
 
-        // ── Spectral flux onset without transient detection ──
-        if (spectralFlux > 0.6)
-            return 2.5; // between 1024 and 2048
-
-        if (spectralFlux > 0.35)
-            return midIdx; // 2048
-
-        // ── Very calm: go large ──
-        if (energyModulation <= VeryCalmModulation
-            && crestFactor <= VeryCalmCrest
-            && attackRatio <= 1.5)
-        {
-            // Tonal content benefits from large blocks
-            if (spectral.Flatness < 0.3)
-                return largeIdx; // 16384
-
-            // Bright content: slightly smaller
-            if (sustainedHighBandRatio >= BrightHighBand || spectral.Brilliance > 0.15)
-                return secLargeIdx; // 8192
-
-            return largeIdx;
-        }
-
-        // ── Calm ──
-        if (energyModulation <= CalmModulation && crestFactor <= CalmCrest && attackRatio <= 2.0)
-        {
-            // Bass-heavy & tonal: large block for frequency resolution
-            if (spectral.SubBass + spectral.Bass > 0.5 && spectral.Flatness < 0.35)
-                return secLargeIdx; // 8192
-
-            if (highBandRatio < BrightHighBand)
-                return maxIdx - 2; // 4096
-
-            return secLargeIdx;
-        }
-
-        // ── Default: moderate activity ──
-        // Use spectral centroid to choose: low centroid → bigger, high centroid → smaller
-        double centroidBias = (1.0 - spectral.Centroid) * 2.0; // 0..2
-        double basePosition = midIdx + centroidBias * 0.5; // 3..4 range typically
-
-        // Noise-like signals need less frequency resolution
-        if (spectral.Flatness > 0.6)
-            basePosition -= 0.5;
-
-        // Very bright: nudge down
-        if (sustainedHighBandRatio >= VeryBrightHighBand)
-            basePosition -= 0.35;
-
-        return Math.Clamp(basePosition, 1.0, maxIdx);
+        return Math.Clamp(basePosition, 0.0, StateCount - 1.0);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -1125,6 +1204,14 @@ public sealed class PulsarPlanner
             }
         }
 
+        ApplyPreEchoSwitching(stateSequence, analyses);
+        ApplyTransientBurstSwitching(stateSequence, analyses);
+        ApplyLateAttackShortBursts(stateSequence, analyses);
+        ApplyRecoveryPromotion(stateSequence, analyses);
+        ApplyGapRecoveryPromotion(stateSequence, analyses);
+        EnforceAdjacentSteps(stateSequence, DefaultStateIndex);
+        SuppressIsolatedBlips(stateSequence, analyses);
+        PromoteLargeBlockRuns(analyses, stateSequence);
         return BuildPlansFromStateSequence(analyses, stateSequence);
     }
 
@@ -1155,7 +1242,380 @@ public sealed class PulsarPlanner
             lastDirection = direction;
         }
 
-        return totalCost + Math.Max(pattern.BlockStates.Length - 1, 0) * 0.03;
+        return totalCost + ComputePatternStructureCost(pattern, analyses, startSegment);
+    }
+
+    private double ComputePatternStructureCost(
+        PulsarContextPattern pattern,
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int startSegment)
+    {
+        double cost = Math.Max(pattern.BlockStates.Length - 1, 0) * _settings.ContextSplitPenalty;
+
+        int segmentOffset = 0;
+        int smallBlockCount = 0;
+        int block256Count = 0;
+
+        foreach (int state in pattern.BlockStates)
+        {
+            int coveredSegments = BlockSteps[state] / PulsarBlockLadder.ControlHopSize;
+            double urgency = ComputeBlockUrgency(analyses, startSegment + segmentOffset, coveredSegments);
+            double desiredPosition = ComputeAverageDesiredPosition(analyses, startSegment + segmentOffset, coveredSegments);
+            double attackNeed = ComputeAttackWindowNeed(analyses, startSegment + segmentOffset, coveredSegments);
+
+            if (state == 0)
+            {
+                cost += _settings.ContextBlock256Penalty;
+                cost += (1.0 - urgency) * _settings.ContextUnjustifiedSmallBlockPenalty;
+                cost += _settings.ContextAttack256Bonus * attackNeed;
+                smallBlockCount++;
+                block256Count++;
+            }
+            else if (state == 1)
+            {
+                cost += _settings.ContextBlock512Penalty;
+                cost += (1.0 - urgency) * _settings.ContextUnjustifiedSmallBlockPenalty * 0.22;
+                cost += _settings.ContextAttack512Bonus * attackNeed;
+                smallBlockCount++;
+            }
+            else if (state == 2 && urgency < 0.18)
+            {
+                cost += (0.18 - urgency) * 0.18;
+            }
+            else if (state == 2 && desiredPosition >= 3.0 && urgency < 0.24)
+            {
+                cost += (desiredPosition - 3.0) * 0.28;
+            }
+            else if (state == 3)
+            {
+                if (urgency < 0.22 && desiredPosition >= 3.0)
+                {
+                    double calmWeight = Math.Clamp((0.22 - urgency) / 0.22, 0.0, 1.0);
+                    double desiredWeight = Math.Clamp((desiredPosition - 3.0) / 1.6, 0.0, 1.0);
+                    cost += _settings.ContextPreferred2048Bonus * (0.55 + (0.45 * Math.Max(calmWeight, desiredWeight)));
+                }
+
+                if (desiredPosition >= 3.8 && urgency < 0.16)
+                {
+                    cost -= 0.05;
+                }
+            }
+
+            if (attackNeed > 0.48 && state >= 2)
+            {
+                double sizePenalty = state switch
+                {
+                    2 => 0.55,
+                    3 => 0.90,
+                    _ => 1.15,
+                };
+
+                cost += _settings.ContextAttackMissPenalty * (attackNeed - 0.48) * sizePenalty;
+            }
+
+            segmentOffset += coveredSegments;
+        }
+
+        if (smallBlockCount >= 3)
+        {
+            cost += (smallBlockCount - 2) * _settings.ContextOverfragmentPenalty * 0.5;
+        }
+
+        if (block256Count >= 2)
+        {
+            cost += (block256Count - 1) * _settings.ContextOverfragmentPenalty;
+        }
+
+        return cost;
+    }
+
+    private static double ComputeLargeBlockTransientRelief(PulsarTransientAnalysis a)
+    {
+        double bassDominance = Math.Clamp((a.LowBandRatio - 0.92) / 0.08, 0.0, 1.0);
+        double highQuietness = Math.Clamp((0.03 - a.HighBandRatio) / 0.03, 0.0, 1.0);
+        double steadyModulation = Math.Clamp((0.26 - a.EnergyModulation) / 0.26, 0.0, 1.0);
+        double tonalWeight = Math.Clamp((0.65 - a.Spectral.Flatness) / 0.65, 0.0, 1.0);
+        double lateAttack = Math.Clamp((a.AttackIndex - 1.0) / 5.0, 0.0, 1.0);
+
+        double relief = (0.34 * bassDominance)
+            + (0.22 * highQuietness)
+            + (0.20 * steadyModulation)
+            + (0.14 * tonalWeight)
+            + (0.10 * lateAttack);
+
+        if (a.SustainedHighBandRatio < 0.02)
+        {
+            relief += 0.08;
+        }
+
+        return Math.Clamp(relief, 0.0, 1.0);
+    }
+
+    private static double ComputePerAnalysisTransientNeed(PulsarTransientAnalysis analysis)
+    {
+        double attackLead = analysis.AttackIndex switch
+        {
+            <= 0 => 1.0,
+            1 => 0.92,
+            2 => 0.72,
+            3 => 0.44,
+            4 => 0.22,
+            _ => 0.10,
+        };
+
+        double levelWeight = analysis.Level switch
+        {
+            PulsarTransientLevel.Hard => 0.42,
+            PulsarTransientLevel.Soft => 0.18,
+            _ => 0.0,
+        };
+
+        double fluxNeed = Math.Clamp((analysis.SpectralFlux - 0.26) / 0.42, 0.0, 1.0);
+        double preEchoNeed = Math.Clamp((analysis.PreEchoRisk - 0.18) / 0.52, 0.0, 1.0);
+        double ratioNeed = Math.Clamp((analysis.AttackRatio - 6.5) / 7.5, 0.0, 1.0);
+        double brightnessNeed = Math.Clamp((analysis.HighBandRatio - 0.02) / 0.14, 0.0, 1.0);
+        double modulationNeed = Math.Clamp((analysis.EnergyModulation - 0.09) / 0.28, 0.0, 1.0);
+        double bassShield = Math.Clamp(
+            ((analysis.Spectral.SubBass * 1.35) + (analysis.Spectral.Bass * 1.05) - (analysis.HighBandRatio * 2.2)),
+            0.0,
+            1.0);
+
+        double need = (0.18 * levelWeight * attackLead)
+            + (0.26 * fluxNeed)
+            + (0.23 * preEchoNeed)
+            + (0.12 * ratioNeed)
+            + (0.11 * brightnessNeed)
+            + (0.16 * modulationNeed);
+
+        need *= 1.0 - ((0.42 - (0.28 * modulationNeed)) * bassShield);
+
+        if (analysis.PreEchoRisk >= 0.72 && analysis.AttackIndex <= 1)
+        {
+            need = Math.Max(need, 0.92);
+        }
+        else if (analysis.PreEchoRisk >= 0.55 && analysis.AttackIndex <= 2)
+        {
+            need = Math.Max(need, 0.78);
+        }
+
+        return Math.Clamp(need, 0.0, 1.0);
+    }
+
+    private static double ComputeBassResolutionNeed(PulsarTransientAnalysis analysis)
+    {
+        double bassEnergy = Math.Clamp(
+            (analysis.Spectral.SubBass * 1.35)
+            + (analysis.Spectral.Bass * 1.10)
+            + (analysis.Spectral.LowMid * 0.40),
+            0.0,
+            1.4);
+        double tonalWeight = Math.Clamp((0.72 - analysis.Spectral.Flatness) / 0.72, 0.0, 1.0);
+        double calmWeight = Math.Clamp((0.30 - analysis.EnergyModulation) / 0.30, 0.0, 1.0);
+        double darkWeight = Math.Clamp((0.06 - analysis.HighBandRatio) / 0.06, 0.0, 1.0);
+
+        double need = (0.52 * Math.Clamp(bassEnergy, 0.0, 1.0))
+            + (0.20 * tonalWeight)
+            + (0.18 * calmWeight)
+            + (0.10 * darkWeight);
+
+        return Math.Clamp(need, 0.0, 1.0);
+    }
+
+    private static double ComputeAttackWindowNeed(
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int startSegment,
+        int coveredSegments)
+    {
+        double bestNeed = 0.0;
+
+        for (int i = 0; i < coveredSegments; i++)
+        {
+            var analysis = analyses[startSegment + i];
+
+            bestNeed = Math.Max(bestNeed, ComputePerAnalysisTransientNeed(analysis));
+        }
+
+        return Math.Clamp(bestNeed, 0.0, 1.0);
+    }
+
+    private static double ComputeBlockUrgency(
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int startSegment,
+        int coveredSegments)
+    {
+        double maxUrgency = 0.0;
+
+        for (int i = 0; i < coveredSegments; i++)
+        {
+            var analysis = analyses[startSegment + i];
+
+            double modulationUrgency = Math.Clamp((analysis.EnergyModulation - 0.10) / 0.28, 0.0, 1.0);
+            double fluxUrgency = Math.Clamp((analysis.SpectralFlux - 0.10) / 0.35, 0.0, 1.0);
+            double clueUrgency = Math.Clamp((analysis.ClueStrength - 0.55) / 0.40, 0.0, 1.0);
+            double attackUrgency = Math.Clamp((analysis.AttackRatio - HardTransientThreshold) / 4.0, 0.0, 1.0);
+
+            double urgency = 0.50 * modulationUrgency
+                + 0.25 * fluxUrgency
+                + 0.15 * clueUrgency
+                + 0.10 * attackUrgency;
+
+            if (analysis.Level == PulsarTransientLevel.Hard && analysis.AttackIndex <= 1)
+            {
+                urgency = Math.Max(urgency, 0.85);
+            }
+            else if (analysis.Level == PulsarTransientLevel.Soft && analysis.AttackIndex <= 1)
+            {
+                urgency = Math.Max(urgency, 0.60);
+            }
+
+            maxUrgency = Math.Max(maxUrgency, urgency);
+        }
+
+        return Math.Clamp(maxUrgency, 0.0, 1.0);
+    }
+
+    private static double ComputeAverageDesiredPosition(
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int startSegment,
+        int coveredSegments)
+    {
+        double total = 0.0;
+        for (int i = 0; i < coveredSegments; i++)
+        {
+            total += analyses[startSegment + i].DesiredLadderPosition;
+        }
+
+        return coveredSegments > 0 ? total / coveredSegments : 0.0;
+    }
+
+    private void PromoteLargeBlockRuns(
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int[] stateSequence)
+    {
+        if (stateSequence.Length < ContextSegmentCount * 2)
+        {
+            return;
+        }
+
+        int contextCount = stateSequence.Length / ContextSegmentCount;
+        if (contextCount <= 0)
+        {
+            return;
+        }
+
+        var promotableContexts = new bool[contextCount];
+        var contextDesired = new double[contextCount];
+        var contextUrgency = new double[contextCount];
+        var contextBassTone = new double[contextCount];
+
+        for (int contextIndex = 0; contextIndex < contextCount; contextIndex++)
+        {
+            int startSegment = contextIndex * ContextSegmentCount;
+            bool all2048 = true;
+
+            for (int i = 0; i < ContextSegmentCount; i++)
+            {
+                if (stateSequence[startSegment + i] != 3)
+                {
+                    all2048 = false;
+                    break;
+                }
+            }
+
+            promotableContexts[contextIndex] = all2048;
+            if (!all2048)
+            {
+                continue;
+            }
+
+            contextDesired[contextIndex] = ComputeAverageDesiredPosition(analyses, startSegment, ContextSegmentCount);
+            contextUrgency[contextIndex] = ComputeBlockUrgency(analyses, startSegment, ContextSegmentCount);
+
+            double bassToneTotal = 0.0;
+            for (int i = 0; i < ContextSegmentCount; i++)
+            {
+                var spectral = analyses[startSegment + i].Spectral;
+                bassToneTotal += spectral.SubBass + spectral.Bass + (0.6 * spectral.LowMid) + ((1.0 - spectral.Flatness) * 0.35);
+            }
+
+            contextBassTone[contextIndex] = bassToneTotal / ContextSegmentCount;
+        }
+
+        foreach (int state in LargeBlockPromotionStates)
+        {
+            int contextsPerBlock = BlockSteps[state] / PulsarBlockLadder.DefaultBlockSize;
+            if (contextsPerBlock <= 1 || contextsPerBlock > contextCount)
+            {
+                continue;
+            }
+
+            for (int contextStart = 0; contextStart <= contextCount - contextsPerBlock; contextStart += contextsPerBlock)
+            {
+                bool eligible = true;
+                double desiredTotal = 0.0;
+                double maxUrgency = 0.0;
+                double bassToneTotal = 0.0;
+
+                for (int contextOffset = 0; contextOffset < contextsPerBlock; contextOffset++)
+                {
+                    int contextIndex = contextStart + contextOffset;
+                    if (!promotableContexts[contextIndex])
+                    {
+                        eligible = false;
+                        break;
+                    }
+
+                    desiredTotal += contextDesired[contextIndex];
+                    maxUrgency = Math.Max(maxUrgency, contextUrgency[contextIndex]);
+                    bassToneTotal += contextBassTone[contextIndex];
+                }
+
+                if (!eligible)
+                {
+                    continue;
+                }
+
+                double averageDesired = desiredTotal / contextsPerBlock;
+                double averageBassTone = bassToneTotal / contextsPerBlock;
+                if (!ShouldPromoteLargeBlock(state, averageDesired, maxUrgency, averageBassTone))
+                {
+                    continue;
+                }
+
+                int segmentStart = contextStart * ContextSegmentCount;
+                int segmentLength = contextsPerBlock * ContextSegmentCount;
+                for (int i = 0; i < segmentLength; i++)
+                {
+                    stateSequence[segmentStart + i] = state;
+                }
+
+                for (int contextOffset = 0; contextOffset < contextsPerBlock; contextOffset++)
+                {
+                    promotableContexts[contextStart + contextOffset] = false;
+                }
+            }
+        }
+    }
+
+    private bool ShouldPromoteLargeBlock(
+        int state,
+        double averageDesired,
+        double maxUrgency,
+        double averageBassTone)
+    {
+        return state switch
+        {
+            4 => averageDesired >= _settings.LargeBlock4096PromotionThreshold
+                && maxUrgency <= 0.24
+                && averageBassTone >= 0.30,
+            5 => averageDesired >= _settings.LargeBlock8192PromotionThreshold
+                && maxUrgency <= 0.16
+                && averageBassTone >= 0.34,
+            6 => averageDesired >= _settings.LargeBlock16384PromotionThreshold
+                && maxUrgency <= 0.11
+                && averageBassTone >= 0.38,
+            _ => false,
+        };
     }
 
     private List<PulsarFramePlan> BuildPlansFromStateSequence(
@@ -1445,18 +1905,31 @@ public sealed class PulsarPlanner
         double cost = distance * _settings.DistancePenalty * Math.Max(a.ClueStrength, 0.35);
 
         int blockSize = BlockSteps[stateIndex];
+        double largeBlockTransientRelief = blockSize >= 2048 ? ComputeLargeBlockTransientRelief(a) : 0.0;
+        double transientNeed = ComputePerAnalysisTransientNeed(a);
+        double bassNeed = ComputeBassResolutionNeed(a);
+        double calmNeed = Math.Clamp((0.26 - a.EnergyModulation) / 0.26, 0.0, 1.0)
+            * Math.Clamp(1.0 - transientNeed, 0.0, 1.0);
 
-        // ── Transient penalties for large blocks ──
-        if (a.Level == PulsarTransientLevel.Hard && stateIndex > 0)
+        cost += (transientNeed * TransientStateBias[stateIndex])
+            + (bassNeed * BassStateBias[stateIndex])
+            + (calmNeed * CalmStateBias[stateIndex]);
+
+        double continuousTransientPenalty = transientNeed * transientNeed;
+        if (stateIndex > 2)
         {
-            cost += stateIndex * _settings.HardTransientLargeBlockPenalty;
-            // Bonus for smallest block on extreme transients
-            if (stateIndex == 0 && IsExtremeHard(a.AttackRatio, a.EnergyModulation, a.CrestFactor))
-                cost += _settings.HardTransientSmallestBlockBonus;
+            double largeStatePenalty = (stateIndex - 2) * (0.82 + (0.58 * transientNeed));
+            if (blockSize >= 2048)
+            {
+                largeStatePenalty *= 1.0 - (0.88 * largeBlockTransientRelief);
+            }
+
+            cost += largeStatePenalty * continuousTransientPenalty;
         }
-        else if (a.Level == PulsarTransientLevel.Soft && stateIndex > 1)
+
+        if (stateIndex == 0 && transientNeed >= 0.90)
         {
-            cost += (stateIndex - 1) * _settings.SoftTransientLargeBlockPenalty;
+            cost += _settings.HardTransientSmallestBlockBonus;
         }
 
         // ── Calm penalties for small blocks ──
@@ -1645,36 +2118,164 @@ public sealed class PulsarPlanner
         for (int i = 0; i < analyses.Count - 6; i++)
         {
             var a = analyses[i + 3];
+            double transientNeed = ComputePerAnalysisTransientNeed(a);
+            bool burstCandidate = transientNeed >= ShortBurstTrigger
+                && a.AttackIndex <= 2
+                && (a.PreEchoRisk >= ShortBurstPreEchoTrigger
+                    || a.SpectralFlux >= ShortBurstFluxTrigger
+                    || a.AttackRatio >= ShortBurstAttackRatioTrigger);
 
-            bool extremeHard = a.Level == PulsarTransientLevel.Hard
-                && a.AttackIndex <= 1
-                && a.AttackRatio >= 8.0
-                && a.SpectralFlux > 0.3;
-
-            if (!extremeHard) continue;
+            if (!burstCandidate) continue;
 
             // V-shape: ramp down to 256, then back up
             // ..., 4096, 2048, 1024, 512, 256, 512, 1024, 2048, 4096, ...
             int center = i + 3;
-            int depth = 0; // 256
+            int depth = transientNeed >= ShortBurst256Trigger ? 0 : 1; // 256 or 512
 
             // Ramp down
             for (int j = 3; j >= 0 && center - (3 - j) >= 0; j--)
             {
                 int idx = center - (3 - j);
-                states[idx] = Math.Min(j, StateCount - 1);
+                states[idx] = Math.Min(states[idx], Math.Max(depth, Math.Min(j, StateCount - 1)));
             }
 
             // Center
-            states[center] = depth;
+            states[center] = Math.Min(states[center], depth);
 
             // Ramp up
             for (int j = 1; j <= 3 && center + j < states.Length; j++)
             {
-                states[center + j] = Math.Min(j, StateCount - 1);
+                states[center + j] = Math.Min(states[center + j], Math.Max(depth, Math.Min(j, StateCount - 1)));
             }
 
             i = center + 3; // skip past
+        }
+    }
+
+    private static void ApplyLateAttackShortBursts(int[] states, IReadOnlyList<PulsarTransientAnalysis> analyses)
+    {
+        if (states.Length < 4) return;
+
+        for (int i = 1; i < analyses.Count - 2; i++)
+        {
+            var a = analyses[i];
+            double transientNeed = ComputePerAnalysisTransientNeed(a);
+            if (transientNeed < LateBurstTrigger) continue;
+            if (a.AttackIndex < 3 || a.AttackIndex > 4) continue;
+            if (a.AttackRatio < LateBurstAttackRatioTrigger) continue;
+            if (a.SpectralFlux < LateBurstFluxTrigger && a.PreEchoRisk < LateBurstPreEchoTrigger) continue;
+
+            bool localPeak = a.AttackRatio >= analyses[i - 1].AttackRatio
+                && a.AttackRatio >= analyses[i + 1].AttackRatio;
+            if (!localPeak) continue;
+
+            int center = Math.Min(i + 1, states.Length - 1);
+
+            if (center - 1 >= 0)
+            {
+                states[center - 1] = Math.Min(states[center - 1], 1);
+            }
+
+            states[center] = 0;
+
+            if (center + 1 < states.Length)
+            {
+                states[center + 1] = Math.Min(states[center + 1], 1);
+            }
+
+            i = center + 1;
+        }
+    }
+
+    private static void ApplyRecoveryPromotion(int[] states, IReadOnlyList<PulsarTransientAnalysis> analyses)
+    {
+        if (states.Length < 4) return;
+
+        for (int i = 1; i < states.Length - 1; i++)
+        {
+            if (states[i] > 1 || states[i - 1] > 1)
+            {
+                continue;
+            }
+
+            for (int ahead = 1; ahead <= 4 && i + ahead < states.Length; ahead++)
+            {
+                int idx = i + ahead;
+                var analysis = analyses[idx];
+                double transientNeed = ComputePerAnalysisTransientNeed(analysis);
+                double bassNeed = ComputeBassResolutionNeed(analysis);
+
+                if (transientNeed > RecoveryStopTransientNeed)
+                {
+                    break;
+                }
+
+                int targetState = bassNeed switch
+                {
+                    >= RecoveryBass4096Threshold => 4,
+                    >= RecoveryBass2048Threshold => 3,
+                    _ => 2,
+                };
+
+                targetState = Math.Min(targetState, ahead switch
+                {
+                    1 => 2,
+                    2 => 3,
+                    _ => 4,
+                });
+
+                states[idx] = Math.Max(states[idx], targetState);
+            }
+        }
+    }
+
+    private static void ApplyGapRecoveryPromotion(int[] states, IReadOnlyList<PulsarTransientAnalysis> analyses)
+    {
+        if (states.Length < 6) return;
+
+        for (int i = 1; i < states.Length - 3; i++)
+        {
+            if (states[i - 1] > 2 && states[i] > 2)
+            {
+                continue;
+            }
+
+            bool quietGap = true;
+            double bassNeedMax = 0.0;
+
+            for (int j = 0; j < 3 && i + j < states.Length; j++)
+            {
+                var a = analyses[i + j];
+                double transientNeed = ComputePerAnalysisTransientNeed(a);
+                bassNeedMax = Math.Max(bassNeedMax, ComputeBassResolutionNeed(a));
+
+                if (transientNeed > GapRecoveryTransientCeiling
+                    || a.SpectralFlux > GapRecoveryFluxCeiling
+                    || a.PreEchoRisk > GapRecoveryPreEchoCeiling)
+                {
+                    quietGap = false;
+                    break;
+                }
+            }
+
+            if (!quietGap)
+            {
+                continue;
+            }
+
+            int targetState = bassNeedMax switch
+            {
+                >= GapRecovery4096BassThreshold => 4,
+                >= GapRecovery2048BassThreshold => 3,
+                _ => 3,
+            };
+
+            for (int j = 0; j < 3 && i + j < states.Length; j++)
+            {
+                states[i + j] = Math.Max(states[i + j], targetState);
+            }
+
+            i += 2;
         }
     }
 
@@ -1706,14 +2307,16 @@ public sealed class PulsarPlanner
 
             if (c < p) // dip down
             {
-                justified = a.Level == PulsarTransientLevel.Hard && a.AttackIndex <= 1;
-                justified |= a.Level == PulsarTransientLevel.Soft && a.AttackIndex <= 0;
-                justified |= a.SpectralFlux > 0.5;
+                double transientNeed = ComputePerAnalysisTransientNeed(a);
+                justified = transientNeed >= 0.58;
+                justified |= a.SpectralFlux > 0.38;
+                justified |= a.PreEchoRisk > 0.34;
             }
             else // bump up
             {
-                justified = a.Level == PulsarTransientLevel.None && a.EnergyModulation >= BusyModulation;
-                justified |= a.Level == PulsarTransientLevel.Hard && a.AttackIndex <= 0;
+                double bassNeed = ComputeBassResolutionNeed(a);
+                justified = bassNeed >= 0.55 && ComputePerAnalysisTransientNeed(a) <= 0.28;
+                justified |= a.Level == PulsarTransientLevel.None && a.EnergyModulation >= BusyModulation;
             }
 
             if (!justified)
@@ -1753,7 +2356,7 @@ public sealed class PulsarPlanner
         {
             var a = analyses[i];
             double clamped = desired[i];
-            if (a.Level != PulsarTransientLevel.None)
+            if (ComputePerAnalysisTransientNeed(a) >= ClampTransientFloor)
                 clamped = Math.Min(clamped, TransientClampPosition(a));
 
             a.DesiredLadderPosition = Math.Clamp(clamped, 0, StateCount - 1.0);
@@ -1762,28 +2365,32 @@ public sealed class PulsarPlanner
 
     private static double TransientClampPosition(PulsarTransientAnalysis a)
     {
-        if (a.Level == PulsarTransientLevel.Hard)
+        double transientNeed = ComputePerAnalysisTransientNeed(a);
+        double bassNeed = ComputeBassResolutionNeed(a);
+
+        if (bassNeed >= Clamp2048BassThreshold && transientNeed <= Clamp2048TransientCeiling)
         {
-            return a.AttackIndex switch
-            {
-                <= 0 => 0.15,
-                1 => 1.10,
-                2 => 2.10,
-                3 => 3.10,
-                4 => 4.10,
-                _ => 5.10,
-            };
+            return a.AttackIndex >= 4 ? 4.20 : 3.10;
         }
 
-        if (a.Level == PulsarTransientLevel.Soft)
+        if (transientNeed >= 0.88)
         {
-            return a.AttackIndex switch
-            {
-                <= 1 => 1.10,
-                2 => 2.10,
-                3 => 3.10,
-                _ => 4.10,
-            };
+            return a.AttackIndex <= 1 ? 0.15 : 0.85;
+        }
+
+        if (transientNeed >= 0.72)
+        {
+            return a.AttackIndex <= 2 ? 1.05 : 1.70;
+        }
+
+        if (transientNeed >= 0.56)
+        {
+            return 2.25;
+        }
+
+        if (transientNeed >= 0.36)
+        {
+            return 3.10;
         }
 
         return StateCount - 1.0;
@@ -1812,6 +2419,76 @@ public sealed class PulsarPlanner
             s += 0.10 * attackWeight;
 
         return Math.Clamp(s, 0.35, 1.30);
+    }
+
+    private static PulsarTransientLevel ClassifyTransientLevel(
+        bool isTransient,
+        bool weakTransient,
+        float tfEstimate,
+        double attackRatio,
+        int attackIndex,
+        double energyModulation,
+        double crestFactor,
+        double highBandRatio,
+        double sustainedHighBandRatio,
+        SpectralProfile spectral,
+        double spectralFlux)
+    {
+        if (!isTransient)
+        {
+            return PulsarTransientLevel.None;
+        }
+
+        double onsetNeed = Math.Clamp((tfEstimate - OpusTransientOnsetCenter) / OpusTransientOnsetRange, 0.0, 1.0);
+        double fluxNeed = Math.Clamp((spectralFlux - TransientFluxCenter) / TransientFluxRange, 0.0, 1.0);
+        double ratioNeed = Math.Clamp((attackRatio - TransientRatioCenter) / TransientRatioRange, 0.0, 1.0);
+        double modulationNeed = Math.Clamp((energyModulation - TransientModulationCenter) / TransientModulationRange, 0.0, 1.0);
+        double crestNeed = Math.Clamp((crestFactor - TransientCrestCenter) / TransientCrestRange, 0.0, 1.0);
+        double brightnessNeed = Math.Clamp((highBandRatio - TransientBrightnessCenter) / TransientBrightnessRange, 0.0, 1.0);
+        double bassShield = Math.Clamp(
+            (spectral.SubBass * 1.35) + (spectral.Bass * 1.05) + (spectral.LowMid * 0.35)
+            - (highBandRatio * 1.8)
+            - (sustainedHighBandRatio * 1.4),
+            0.0,
+            1.0);
+        double lateAttackPenalty = attackIndex switch
+        {
+            <= 1 => 0.0,
+            2 => 0.08,
+            3 => 0.18,
+            _ => 0.28,
+        };
+
+        double score = (0.34 * onsetNeed)
+            + (0.18 * fluxNeed)
+            + (0.14 * ratioNeed)
+            + (0.16 * modulationNeed)
+            + (0.10 * crestNeed)
+            + (0.08 * brightnessNeed)
+            - ((0.28 - (0.18 * modulationNeed)) * bassShield)
+            - lateAttackPenalty;
+
+        if (weakTransient)
+        {
+            score -= OpusWeakTransientPenalty;
+        }
+
+        if (spectralFlux >= OpusEarlyFluxTrigger && attackIndex <= 1)
+        {
+            score += OpusEarlyFluxBonus;
+        }
+
+        if (score >= OpusTransientHardThreshold)
+        {
+            return PulsarTransientLevel.Hard;
+        }
+
+        if (score >= OpusTransientSoftThreshold)
+        {
+            return PulsarTransientLevel.Soft;
+        }
+
+        return PulsarTransientLevel.None;
     }
 
     private static double ApplyAttackLead(PulsarTransientLevel level, double pos, int attackIndex)

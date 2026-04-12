@@ -4,6 +4,7 @@ public sealed class PulsarContainerFile
 {
 	public PulsarContainerHeader Header { get; } = new();
 	public List<PulsarFramePacket> Frames { get; } = new();
+	public List<PulsarSuperframePacket> Superframes { get; } = new();
 }
 
 public enum PulsarCabacProfile
@@ -18,10 +19,30 @@ public sealed class PulsarContainerHeader
 	public int Version { get; set; } = 1;
 	public int SampleRate { get; set; }
 	public int ChannelCount { get; set; }
+	public ushort Flags { get; set; }
+	public long TotalSamples { get; set; }
+	public uint SeekTableOffsetBytes { get; set; }
 	public int AnalysisFrameSize { get; set; } = PulsarBlockLadder.AnalysisFrameSize;
 	public int ControlHopSize { get; set; } = PulsarBlockLadder.ControlHopSize;
 	public int MinBlockSize { get; set; } = PulsarBlockLadder.MinBlockSize;
 	public int MaxBlockSize { get; set; } = PulsarBlockLadder.MaxBlockSize;
+}
+
+public enum PulsarLargeBlockState : byte
+{
+	Standalone = 0,
+	PartOf4096 = 1,
+	PartOf8192 = 2,
+	PartOf16384 = 3,
+}
+
+public sealed class PulsarSuperframePacket
+{
+	public int Index { get; set; }
+	public byte PatternId { get; set; }
+	public PulsarLargeBlockState LargeBlockState { get; set; } = PulsarLargeBlockState.Standalone;
+	public byte[] SideInfo { get; set; } = [];
+	public byte[] EntropyPayload { get; set; } = [];
 }
 
 // Minimal 2-byte frame header for future stream compatibility.

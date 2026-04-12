@@ -19,6 +19,13 @@ public sealed class PulsarPsychoResult
     public float PerceptualEntropy { get; set; }
     public float TotalEnergyDb { get; set; }
     public float TransientScore { get; set; }
+    public float OpusTransientEstimate { get; set; }
+    public float AveragePositiveSmr { get; set; }
+    public float PeakSmr { get; set; }
+    public float MaskingPressure { get; set; }
+    public float BassProtection { get; set; }
+    public float TonalProtection { get; set; }
+    public float LowBandStability { get; set; }
 }
 
 public sealed class PulsarPsychoSongAnalysis
