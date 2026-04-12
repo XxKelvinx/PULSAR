@@ -36,6 +36,7 @@ Das neue Architekturziel für Pulsar ist ein echter VBR-Encoder, der sich nicht 
 - Die Dateigröße darf variieren wie bei Opus oder LAME VBR.
 - Komplexe Abschnitte bekommen viele Bits, ruhige/leichte Stellen nur noch sehr wenige.
 - Es gibt keinen harten Bitdeckel pro Frame mehr; stattdessen gibt es ein globales Budget und einen proportionalen Verteilungsschlüssel.
+- Der aktuelle CLI-Entwurf unterstützt nur `-V 0` bis `-V 9` als Qualitätslevels und zielt auf PCM-Ausgabe, nicht auf eine feste Bitrate.
 
 2. Globaler 2-Pass-Scan
 

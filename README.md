@@ -2,7 +2,7 @@
 
 ![PULSAR banner](Pictures/PulsarBanner.png)
 
-PULSAR is an experimental offline transform codec prototype. It is designed for archive-quality audio processing, not realtime low-latency streaming. The codec focuses on global analysis, adaptive block switching, psychoacoustic budgeting, and a clean transform/quantization workflow.
+PULSAR is an experimental offline transform codec prototype. It is designed for archive-quality audio processing, not realtime low-latency streaming. The codec focuses on global analysis, adaptive block switching, psychoacoustic budgeting, and a clean transform/quantization workflow. The current implementation supports only `-V 0` through `-V 9` and targets PCM output rather than enforcing a fixed bitrate.
 
 ## Purpose
 
@@ -49,6 +49,8 @@ The current CLI supports:
 - `--vbrplsrpcm`
 - `--decodeplsr`
 - `--compare`
+
+Supported quality levels are currently `-V 0` through `-V 9`. The focus is on PCM rendering and quality-controlled VBR behavior, not on a fixed bitrate mode.
 
 ## What is implemented today
 
