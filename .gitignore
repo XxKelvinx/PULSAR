@@ -8,8 +8,6 @@ build_temp/
 out-test/
 
 # Large local references and test assets
-Reference Open Source/
-TestWAVs/
 
 # OS noise
 Thumbs.db

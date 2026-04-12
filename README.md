@@ -2,62 +2,77 @@
 
 ![PULSAR banner](Pictures/PulsarBanner.png)
 
-PULSAR is an experimental offline transform codec prototype focused on adaptive block switching, transient-aware planning, and transparent reconstruction.
+PULSAR is an experimental offline transform codec prototype. It is designed for archive-quality audio processing, not realtime low-latency streaming. The codec focuses on global analysis, adaptive block switching, psychoacoustic budgeting, and a clean transform/quantization workflow.
 
-The current project is built around three ideas:
+## Purpose
 
-- analyze the whole signal offline instead of making purely local decisions
-- choose block structure from the signal itself, especially around transients
-- keep the transform path mathematically clean enough to null-test near float precision
+PULSAR aims to be a high-quality offline codec that saves bits where the audio is easy and invests them where the signal is perceptually demanding. It treats analysis, block selection, allocation, and reconstruction as a unified system rather than independent steps.
 
-## Current State
+## Philosophy
 
-PULSAR is still a prototype, but the core pieces are already in place:
+- Offline analysis and multi-pass planning are acceptable.
+- Large lookahead is a feature, not a bug.
+- Transient-aware block switching should follow the signal, not a fixed grid.
+- Psychoacoustic and masking models should guide allocation, not arbitrary heuristics.
+- The system should reuse proven reference ideas from existing open-source codecs instead of inventing weak substitutes.
 
-- `Logic/PulsarPlanner.cs` performs full-song analysis and chooses an adaptive block path
-- `Core/PulsarTransformEngine.cs` renders the transform path with MDCT/IMDCT
-- `Logic/PulsarAllocator.cs` contains an early bitrate allocation model
-- `Program.cs` exposes the experimental CLI modes
+## Core Architecture
 
-Recent work moved the planner to a 2048-superframe context and fixed the transform edge handling, which dramatically improved planner speed and restored near-perfect reconstruction.
+### Current focus
 
-## Why It Exists
+- `Logic/PulsarPlanner.cs` performs full-song analysis and chooses an adaptive block path with cost-based switching.
+- `Psycho/PulsarPsychoCore.cs` generates psychoacoustic frame data, including band energies, tonality, masking thresholds, SMR, and perceptual entropy.
+- `Logic/PulsarAllocator.cs` turns psycho data into frame budgets and band bit distributions.
+- `Core/PulsarTransformEngine.cs` renders the planned blocks with MDCT/IMDCT and a block-ladder switching path.
+- `Core/PulsarQuantizer.cs` converts bandbits and psycho results into quantized bands and dequantizes them for rendering.
+- `Core/PulsarSuperframeArchiveCodec.cs` and `IO/PulsarRangeCoder.cs` drive the experimental archive/PLSR path.
 
-PULSAR is not trying to be a low-latency realtime codec first. It is aimed at offline quality:
+### Current workflow
 
-- large lookahead is acceptable
-- multi-pass analysis is acceptable
-- planner complexity is acceptable if it improves audible results
+1. Read PCM input.
+2. `PulsarPlanner` analyzes the full signal and selects block sizes.
+3. `PulsarPsychoCore` performs psychoacoustic analysis on the same frames.
+4. `PulsarAllocator` produces budgets and bandbit allocations.
+5. `PulsarTransformEngine` renders the chosen block path.
+6. `PulsarQuantizer` quantizes and dequantizes spectral bands.
+7. `Program.cs` writes output WAV files and logs results.
 
-That makes it a good playground for global path planning, transient handling, and future bitstream research.
+## Experimental Modes
 
-## Project Layout
+The current CLI supports:
 
-- `Core/` transform engine, block ladder, packing primitives
-- `Logic/` planner, allocator, crossover logic
-- `Psycho/` transient and perceptual analysis
-- `IO/` bitstream and container scaffolding
-- `Pictures/` repository artwork used by this README
+- `--legacy`
+- `--legacyP`
+- `--legacyP-fast`
+- `--vbr`
+- `--vbrplsr`
+- `--vbrplsrpcm`
+- `--decodeplsr`
+- `--compare`
 
-## CLI
+## What is implemented today
 
-Current test entry points live in `Program.cs`.
+- A prototype transform/render path with MDCT/IMDCT and block switching.
+- Psychoacoustic analysis including PE, masking spreading, tonality, and SMR.
+- A first psycho-driven VBR allocation model.
+- An experimental archive codec path for spectral PCM and PLSR bitstream experiments.
 
-Examples:
+## Limitations
 
-```powershell
-dotnet run --project PulsarCodec.csproj -- --legacy "input.wav" "output.wav" 1024
-dotnet run --project PulsarCodec.csproj -- --legacyP "input.wav" "output.wav"
-dotnet run --project PulsarCodec.csproj -- --legacyP-fast "input.wav" "output.wav"
-dotnet run --project PulsarCodec.csproj -- --vbr 128 "input.wav" "output.wav"
-dotnet run --project PulsarCodec.csproj -- --compare "original.wav" "processed.wav"
-```
+- This is still an experimental prototype.
+- There is no final Pulsar bitstream format yet.
+- Quantization is currently a reference path, not a finalized codec engine.
+- The system is optimized for research and validation, not production distribution.
 
-## Notes
+## Project layout
 
-- This repository intentionally tracks the codec code, not large generated outputs.
-- The current WAV render path is mainly for experimentation and validation.
-- A final Pulsar bitstream/container format is still a work in progress.
+- `Core/` transform engine, quantizer, archive codec, packers
+- `Logic/` planner, allocator, demand modelling
+- `Psycho/` perceptual analysis and transient detection
+- `IO/` bitstream reader/writer and archive scaffolding
+- `Pictures/` artwork and README images
+- `TestWAVs/` sample WAV files and experimental inputs
+- `Reference Open Source/` source references from external codec implementations
 
 ## Build
 
@@ -65,9 +80,8 @@ dotnet run --project PulsarCodec.csproj -- --compare "original.wav" "processed.w
 dotnet build PulsarCodec.csproj
 ```
 
-## Roadmap
+## Notes
 
-- connect planner output directly to a real Pulsar bitstream
-- tighten quantization and allocation around perceptual targets
-- make the render path superframe-native end to end
-- evolve the prototype into a complete encoder/decoder flow
+- This repository is private and tracks experimental data, reference material, and development artifacts.
+- `Reference Open Source/` and `TestWAVs/` are intentionally included in the repo for inspection.
+- The current focus is on architecture validation, not final packaging.
