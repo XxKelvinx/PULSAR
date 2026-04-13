@@ -35,6 +35,7 @@ public sealed class PulsarFramePlan
     public required int SegmentIndex { get; init; }
     public required int PreviousBlockSize { get; init; }
     public required int BlockSize { get; init; }
+    public required int NextBlockSize { get; init; }
     public required int TargetBlockSize { get; init; }
     public required PulsarSwitchDirection Direction { get; init; }
     public required PulsarTransientLevel TransientLevel { get; init; }
@@ -1634,11 +1635,14 @@ public sealed class PulsarPlanner
             int previousStateIndex = segmentIndex == 0 ? DefaultStateIndex : stateSequence[segmentIndex - 1];
             int directionIndex = DirFromDelta(stateIndex - previousStateIndex);
 
+            int nextBlockSize = segmentIndex == stateSequence.Count - 1 ? blockSize : BlockSteps[stateSequence[segmentIndex + 1]];
+
             plans.Add(new PulsarFramePlan
             {
                 SegmentIndex = segmentIndex,
                 PreviousBlockSize = previousBlockSize,
                 BlockSize = blockSize,
+                NextBlockSize = nextBlockSize,
                 TargetBlockSize = targetBlockSize,
                 Direction = DirFromIndex(directionIndex),
                 TransientLevel = analysis.Level,
@@ -1811,11 +1815,14 @@ public sealed class PulsarPlanner
             int prevSi = s == 0 ? defIdx : stateSeq[s - 1];
             int dirIdx = DirFromDelta(si - prevSi);
 
+            int nextBlockSize = s == segCount - 1 ? blockSize : BlockSteps[stateSeq[s + 1]];
+
             plans.Add(new PulsarFramePlan
             {
                 SegmentIndex = s,
                 PreviousBlockSize = prevBlockSize,
                 BlockSize = blockSize,
+                NextBlockSize = nextBlockSize,
                 TargetBlockSize = targetBlockSize,
                 Direction = DirFromIndex(dirIdx),
                 TransientLevel = a.Level,

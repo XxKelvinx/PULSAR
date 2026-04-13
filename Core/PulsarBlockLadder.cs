@@ -64,6 +64,11 @@ public static class PulsarBlockLadder
 		return blockSize / 2;
 	}
 
+	public static int GetOverlapSize(int blockSize)
+	{
+		return GetHopSize(blockSize);
+	}
+
 	public static int GetIndex(int blockSize)
 	{
 		int index = Array.IndexOf(Steps, blockSize);
