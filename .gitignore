@@ -1,14 +1,23 @@
-# Build output
+# Ignore generated output only
+Artifacts/Output/
+
+# Ignore build artifacts
 bin/
 obj/
 
-# Local tooling
+# Ignore editor and local settings
 .vscode/
-build_temp/
-out-test/
+.claude/
 
-# Large local references and test assets
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
-# OS noise
-Thumbs.db
-Desktop.ini
+# Misc temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.DS_Store

@@ -5,7 +5,9 @@ using Pulsar.Psycho;
 public sealed class PulsarAllocationConfig
 {
     // TRUE VBR: Wir nutzen Qualitätsstufen (0 bis 9) statt TargetKbps!
-    // 9 = Best (Gottmodus/Transparent), 5 = Normal, 0 = Worst (Starke Kompression)
+    // 0 = Best (Transparent), 5 = Normal, 9 = Worst (Starke Kompression)
+    // Achtung: Die effektive Quality-Zuordnung im aktuellen Projekt wird durch die Bitbudget-Formel
+    // in Program.cs sowie durch den Quantizer zusammen bestimmt.
     public int Quality { get; init; } = 4; 
 
     public int SampleRate { get; init; } = 44100;
@@ -55,8 +57,9 @@ public sealed class PulsarAllocator
     private readonly PulsarDemandModel _demandModel;
 
     // LAME-Style BaseGains für V0 bis V9
-    // Q9 = Gain 10 (Fast verlustfrei), Q0 = Gain 400 (sehr lo-fi)
-    private static readonly int[] QualityBaseGains = { 10, 30, 60, 100, 150, 200, 250, 300, 350, 400 };
+    // Q0 = Gain 400 (grobe Quantisierung, geringere Qualität), Q9 = Gain 10 (feinere Quantisierung, höhere Qualität)
+    // In der aktuellen Pipeline liefert das Gesamtverhalten aber dennoch V0 als höchste und V9 als niedrigste Qualität.
+    private static readonly int[] QualityBaseGains = { 400, 350, 300, 250, 200, 150, 100, 60, 30, 10 };
 
     public PulsarAllocator(PulsarAllocationConfig? config = null)
     {
