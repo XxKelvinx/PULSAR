@@ -1,0 +1,23 @@
+# Ignore generated output only
+Artifacts/Output/
+
+# Ignore build artifacts
+bin/
+obj/
+
+# Ignore editor and local settings
+.vscode/
+.claude/
+
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Misc temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.DS_Store
