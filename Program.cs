@@ -164,10 +164,13 @@ if (useDecodePlsrMode)
 var inputAudio = ReadAudioFile(inputPath);
 int channels = inputAudio.WaveFormat.Channels;
 int inputSampleRate = inputAudio.WaveFormat.SampleRate;
-int sampleRate = PulsarWorkingSampleRate;
+int sampleRate = useLegacyMode || useLegacyPlanMode ? inputSampleRate : PulsarWorkingSampleRate;
 
-var samples = ResampleInterleaved(inputAudio.Samples, channels, inputSampleRate, sampleRate);
+var samples = sampleRate == inputSampleRate
+    ? inputAudio.Samples
+    : ResampleInterleaved(inputAudio.Samples, channels, inputSampleRate, sampleRate);
 float[] processed;
+double? engineProcessingSeconds = null;
 
 // --- FULL ARCHIVE ENCODE/DECODE MODE ---
 if (useVbrPlsrMode)
@@ -184,6 +187,7 @@ if (useVbrPlsrMode)
 
     WriteResidualComparison(inputPath, decodedOutputPath!, "packer");
     AppendArchiveSummary(decodedOutputPath!, outputPath, archive.Length);
+    WritePlannerLogs(outputPath, sampleRate, BuildArchiveStylePlanners(samples, channels, targetKbps));
     double seconds = decoded.Samples.Length / (double)(decoded.SampleRate * decoded.Channels);
     double avgKbps = archive.Length * 8.0 / Math.Max(seconds, 1e-9) / 1000.0;
     Console.WriteLine($"PULSAR archive encoded: {outputPath} ({avgKbps:0.00} kbps)");
@@ -200,17 +204,26 @@ if (useLegacyPlanMode)
     Console.WriteLine($"Running Pure MDCT Legacy Mode with frame planning...");
     planners = new PulsarPlanner[channels];
     for (int channel = 0; channel < channels; channel++) planners[channel] = new PulsarPlanner();
+    var engineStopwatch = Stopwatch.StartNew();
     processed = ProcessLegacyPlanner(samples, channels, planners);
+    engineStopwatch.Stop();
+    engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
 }
 else if (useLegacyMode)
 {
     Console.WriteLine($"Running Pure MDCT Legacy Mode (BlockSize: {legacyBlockSize})...");
+    var engineStopwatch = Stopwatch.StartNew();
     processed = ProcessLegacy(samples, channels, legacyBlockSize);
+    engineStopwatch.Stop();
+    engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
 }
 else
 {
     Console.WriteLine($"Running VBR Spectral Process (Quality: {effectiveVbrQuality}) using archive-style quantization...");
+    var engineStopwatch = Stopwatch.StartNew();
     processed = PulsarSuperframeArchiveCodec.RenderSpectralPcm(samples, sampleRate, channels, targetKbps, effectiveVbrQuality).Samples;
+    engineStopwatch.Stop();
+    engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
 }
 
 var outputFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels);
@@ -219,12 +232,16 @@ using (var writer = new WaveFileWriter(outputPath, outputFormat))
     writer.WriteSamples(processed, 0, processed.Length);
 }
 
-WriteResidualComparison(inputPath, outputPath, useLegacyMode ? "legacy" : "bypass");
+WriteResidualComparison(inputPath, outputPath, useLegacyMode ? "legacy" : "bypass", engineProcessingSeconds);
 
 if (planners is not null)
 {
     WritePlannerLogs(outputPath, sampleRate, planners);
     if (allocationsByChannel is not null) WriteAllocationLogs(outputPath, sampleRate, channels, allocationsByChannel, targetKbps);
+}
+else if (useVbrMode)
+{
+    WritePlannerLogs(outputPath, sampleRate, BuildArchiveStylePlanners(samples, channels, targetKbps));
 }
 
 Console.WriteLine(useLegacyMode 
@@ -409,31 +426,13 @@ static (float[] Processed, PulsarPlanner[] Planners, List<PulsarFrameAllocation>
 
     Parallel.For(0, channels, channel =>
     {
-        var result = PulsarTransformEngine.ProcessWithPlans(channelBuffers[channel], planners[channel]);
-        
-        // --- TEMPORÄRER STUFE 2 FIX ---
-        // Wir fixieren die Blöcke auf 2048, damit wir den Quantizer OHNE Aliasing-Probleme testen können!
-        var fixedPlans = new List<PulsarFramePlan>();
-        foreach (var plan in result.Plans)
-        {
-            fixedPlans.Add(new PulsarFramePlan 
-            {
-                SegmentIndex = plan.SegmentIndex, PreviousBlockSize = 2048, BlockSize = 2048, NextBlockSize = 2048, TargetBlockSize = 2048,
-                Direction = PulsarSwitchDirection.Hold, TransientLevel = plan.TransientLevel, AttackRatio = plan.AttackRatio, 
-                PeakDeltaDb = plan.PeakDeltaDb, AttackIndex = plan.AttackIndex, EnergyModulation = plan.EnergyModulation, 
-                CrestFactor = plan.CrestFactor, LowBandRatio = plan.LowBandRatio, HighBandRatio = plan.HighBandRatio,
-                SustainedHighBandRatio = plan.SustainedHighBandRatio, DesiredLadderPosition = plan.DesiredLadderPosition, 
-                ClueStrength = plan.ClueStrength, PathCost = plan.PathCost, Spectral = plan.Spectral, 
-                PreEchoRisk = plan.PreEchoRisk, SpectralFlux = plan.SpectralFlux
-            });
-        }
+        List<PulsarFramePlan> renderPlans = planners[channel].PlanLegacyRenderSong(channelBuffers[channel]);
 
         var psycho = new PulsarPsycho(new PulsarPsychoSettings { SampleRate = sampleRate, FftSize = 2048, HopSize = PulsarBlockLadder.ControlHopSize });
         var psychoFrames = psycho.AnalyzeSong(channelBuffers[channel]);
-        allocations[channel] = allocator.AllocateSong(fixedPlans, psychoFrames);
+        allocations[channel] = allocator.AllocateSong(planners[channel].LastPlan, psychoFrames);
         
-        // Hier feuern wir das Audio durch den Quantizer!
-        processedChannels[channel] = PulsarTransformEngine.ProcessWithBitAllocation(channelBuffers[channel], fixedPlans, allocations[channel], psychoFrames);
+        processedChannels[channel] = PulsarTransformEngine.ProcessWithBitAllocation(channelBuffers[channel], renderPlans, allocations[channel], psychoFrames);
     });
 
     var output = new float[interleavedSamples.Length];
@@ -478,10 +477,10 @@ static float[] ProcessLegacy(float[] interleavedSamples, int channels, int block
             channelBuffers[channel][frame] = interleavedSamples[frame * channels + channel];
 
     var processedChannels = new float[channels][];
-    Parallel.For(0, channels, channel =>
+    for (int channel = 0; channel < channels; channel++)
     {
         processedChannels[channel] = PulsarTransformEngine.ProcessLegacy(channelBuffers[channel], blockSize);
-    });
+    }
 
     var output = new float[interleavedSamples.Length];
     for (int channel = 0; channel < channels; channel++)
@@ -503,10 +502,10 @@ static float[] ProcessLegacyPlanner(float[] interleavedSamples, int channels, Pu
             channelBuffers[channel][frame] = interleavedSamples[frame * channels + channel];
 
     var processedChannels = new float[channels][];
-    Parallel.For(0, channels, channel =>
+    for (int channel = 0; channel < channels; channel++)
     {
         processedChannels[channel] = PulsarTransformEngine.ProcessLegacyPlanner(channelBuffers[channel], planners[channel]);
-    });
+    }
 
     var output = new float[interleavedSamples.Length];
     for (int channel = 0; channel < channels; channel++)
@@ -517,7 +516,135 @@ static float[] ProcessLegacyPlanner(float[] interleavedSamples, int channels, Pu
     return output;
 }
 
-static void WritePlannerLogs(string outputPath, int sampleRate, IReadOnlyList<PulsarPlanner> planners) { /* Omitted for brevity */ }
+static PulsarPlanner[] BuildArchiveStylePlanners(float[] interleavedSamples, int channels, int targetKbps)
+{
+    if (channels <= 0) return Array.Empty<PulsarPlanner>();
+
+    var channelBuffers = new float[channels][];
+    int frames = interleavedSamples.Length / channels;
+    for (int channel = 0; channel < channels; channel++) channelBuffers[channel] = new float[frames];
+
+    for (int frame = 0; frame < frames; frame++)
+        for (int channel = 0; channel < channels; channel++)
+            channelBuffers[channel][frame] = interleavedSamples[frame * channels + channel];
+
+    bool useMidSideStereo = channels == 2 && targetKbps <= PulsarJointStereoThresholdKbps;
+    if (useMidSideStereo) ApplyMidSideStereo(channelBuffers[0], channelBuffers[1]);
+
+    var sharedPlanner = new PulsarPlanner();
+    sharedPlanner.PlanLegacyRenderSong(channelBuffers[0]);
+
+    var planners = new PulsarPlanner[channels];
+    for (int channel = 0; channel < channels; channel++)
+    {
+        planners[channel] = sharedPlanner;
+    }
+
+    return planners;
+}
+
+static void WritePlannerLogs(string outputPath, int sampleRate, IReadOnlyList<PulsarPlanner> planners)
+{
+    if (planners.Count == 0) return;
+
+    string outputDirectory = Path.GetDirectoryName(outputPath) ?? Directory.GetCurrentDirectory();
+
+    for (int channel = 0; channel < planners.Count; channel++)
+    {
+        PulsarPlanner planner = planners[channel];
+
+        if (planner.LastAnalyses.Count > 0)
+        {
+            string analysisPath = Path.Combine(outputDirectory, $"planner-channel-{channel}-analysis.csv");
+            using var writer = new StreamWriter(analysisPath, false);
+            writer.WriteLine("segment_index,time_s,transient_level,attack_ratio,peak_delta_db,attack_index,energy_modulation,crest_factor,low_band_ratio,high_band_ratio,sustained_high_band_ratio,desired_ladder_position,clue_strength,pre_echo_risk,spectral_flux,sub_bass,bass,low_mid,mid,high_mid,presence,brilliance,centroid,flatness");
+            foreach (PulsarTransientAnalysis analysis in planner.LastAnalyses)
+            {
+                double timeSeconds = analysis.SegmentIndex * (PulsarBlockLadder.ControlHopSize / (double)sampleRate);
+                writer.WriteLine(string.Join(',',
+                    analysis.SegmentIndex,
+                    FormatDouble(timeSeconds),
+                    analysis.Level,
+                    FormatDouble(analysis.AttackRatio),
+                    FormatDouble(analysis.PeakDeltaDb),
+                    analysis.AttackIndex,
+                    FormatDouble(analysis.EnergyModulation),
+                    FormatDouble(analysis.CrestFactor),
+                    FormatDouble(analysis.LowBandRatio),
+                    FormatDouble(analysis.HighBandRatio),
+                    FormatDouble(analysis.SustainedHighBandRatio),
+                    FormatDouble(analysis.DesiredLadderPosition),
+                    FormatDouble(analysis.ClueStrength),
+                    FormatDouble(analysis.PreEchoRisk),
+                    FormatDouble(analysis.SpectralFlux),
+                    FormatDouble(analysis.Spectral.SubBass),
+                    FormatDouble(analysis.Spectral.Bass),
+                    FormatDouble(analysis.Spectral.LowMid),
+                    FormatDouble(analysis.Spectral.Mid),
+                    FormatDouble(analysis.Spectral.HighMid),
+                    FormatDouble(analysis.Spectral.Presence),
+                    FormatDouble(analysis.Spectral.Brilliance),
+                    FormatDouble(analysis.Spectral.Centroid),
+                    FormatDouble(analysis.Spectral.Flatness)));
+            }
+        }
+
+        if (planner.LastPlan.Count > 0)
+        {
+            string planPath = Path.Combine(outputDirectory, $"planner-channel-{channel}-segments.csv");
+            using var writer = new StreamWriter(planPath, false);
+            writer.WriteLine("segment_index,time_s,previous_block_size,block_size,next_block_size,target_block_size,direction,transient_level,pre_echo_risk,spectral_flux,clue_strength,desired_ladder_position");
+            foreach (PulsarFramePlan plan in planner.LastPlan)
+            {
+                double timeSeconds = plan.SegmentIndex * (PulsarBlockLadder.ControlHopSize / (double)sampleRate);
+                writer.WriteLine(string.Join(',',
+                    plan.SegmentIndex,
+                    FormatDouble(timeSeconds),
+                    plan.PreviousBlockSize,
+                    plan.BlockSize,
+                    plan.NextBlockSize,
+                    plan.TargetBlockSize,
+                    plan.Direction,
+                    plan.TransientLevel,
+                    FormatDouble(plan.PreEchoRisk),
+                    FormatDouble(plan.SpectralFlux),
+                    FormatDouble(plan.ClueStrength),
+                    FormatDouble(plan.DesiredLadderPosition)));
+            }
+        }
+
+        if (planner.LastLegacyRenderPlan.Count > 0)
+        {
+            string renderPath = Path.Combine(outputDirectory, $"planner-channel-{channel}-render.csv");
+            using var writer = new StreamWriter(renderPath, false);
+            writer.WriteLine("frame_index,start_time_s,segment_index,previous_block_size,block_size,next_block_size,target_block_size,direction,transient_level,pre_echo_risk,spectral_flux,clue_strength");
+
+            int frameStartSamples = 0;
+            for (int frameIndex = 0; frameIndex < planner.LastLegacyRenderPlan.Count; frameIndex++)
+            {
+                PulsarFramePlan plan = planner.LastLegacyRenderPlan[frameIndex];
+                double timeSeconds = frameStartSamples / (double)sampleRate;
+                writer.WriteLine(string.Join(',',
+                    frameIndex,
+                    FormatDouble(timeSeconds),
+                    plan.SegmentIndex,
+                    plan.PreviousBlockSize,
+                    plan.BlockSize,
+                    plan.NextBlockSize,
+                    plan.TargetBlockSize,
+                    plan.Direction,
+                    plan.TransientLevel,
+                    FormatDouble(plan.PreEchoRisk),
+                    FormatDouble(plan.SpectralFlux),
+                    FormatDouble(plan.ClueStrength)));
+
+                int rightOverlap = Math.Min(plan.BlockSize / 2, plan.NextBlockSize / 2);
+                frameStartSamples += plan.BlockSize - rightOverlap;
+            }
+        }
+    }
+}
+
 static void WriteAllocationLogs(string outputPath, int sampleRate, int channels, IReadOnlyList<List<PulsarFrameAllocation>> allocationsByChannel, int targetKbps)
 {
     if (allocationsByChannel.Count == 0) return;
@@ -582,7 +709,7 @@ static void PrintUsage()
 
 static int QualityToNominalKbps(int quality) => new int[] { 320, 288, 256, 224, 192, 160, 128, 112, 96, 80 }[Math.Clamp(quality, 0, 9)];
 
-static void WriteResidualComparison(string originalPath, string processedPath, string mode)
+static void WriteResidualComparison(string originalPath, string processedPath, string mode, double? engineProcessingSeconds = null)
 {
     if (!File.Exists(originalPath) || !File.Exists(processedPath)) return;
     var originalReader = ReadAudioFile(originalPath);
@@ -619,6 +746,11 @@ static void WriteResidualComparison(string originalPath, string processedPath, s
         summary.WriteLine($"Mode: {mode}");
         summary.WriteLine($"Input file: {Path.GetFileName(originalPath)}");
         summary.WriteLine($"Output file: {Path.GetFileName(processedPath)}");
+        if (engineProcessingSeconds.HasValue)
+        {
+            summary.WriteLine($"Engine processing seconds: {FormatDouble(engineProcessingSeconds.Value)}");
+            summary.WriteLine($"Engine processing ms: {FormatDouble(engineProcessingSeconds.Value * 1000.0)}");
+        }
         summary.WriteLine($"Duration seconds: {FormatDouble(seconds)}");
         summary.WriteLine($"Decoded WAV kbits: {FormatDouble(decodedKbits)}");
         summary.WriteLine($"Decoded WAV bitrate kbps: {FormatDouble(decodedKbps)}");

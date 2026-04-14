@@ -203,6 +203,8 @@ internal sealed class PulsarContextPattern
 
 public sealed class PulsarPlanner
 {
+    private const int LegacyRenderQuantum = PulsarBlockLadder.MinBlockSize / 2;
+
     // ── Full block ladder: 7 steps from 256 to 16384 ──
     private static readonly int[] BlockSteps = { 256, 512, 1024, 2048, 4096, 8192, 16384 };
     private static readonly int StateCount = BlockSteps.Length;
@@ -219,6 +221,7 @@ public sealed class PulsarPlanner
 
     public IReadOnlyList<PulsarTransientAnalysis> LastAnalyses { get; private set; } = Array.Empty<PulsarTransientAnalysis>();
     public IReadOnlyList<PulsarFramePlan> LastPlan { get; private set; } = Array.Empty<PulsarFramePlan>();
+    public IReadOnlyList<PulsarFramePlan> LastLegacyRenderPlan { get; private set; } = Array.Empty<PulsarFramePlan>();
 
     // ── Thresholds ──
     private const double HardTransientThreshold = 8.0;
@@ -319,6 +322,7 @@ public sealed class PulsarPlanner
         {
             LastAnalyses = Array.Empty<PulsarTransientAnalysis>();
             LastPlan = Array.Empty<PulsarFramePlan>();
+            LastLegacyRenderPlan = Array.Empty<PulsarFramePlan>();
             return new List<PulsarFramePlan>();
         }
 
@@ -330,6 +334,180 @@ public sealed class PulsarPlanner
         LastAnalyses = analyses;
         LastPlan = plan;
         return plan;
+    }
+
+    public List<PulsarFramePlan> PlanLegacyRenderSong(float[] input, Action<int, int>? progress = null)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        List<PulsarFramePlan> segmentPlans = PlanSong(input, progress);
+        List<PulsarFramePlan> renderPlans = BuildLegacyRenderSchedule(segmentPlans, LastAnalyses, input.Length);
+        LastLegacyRenderPlan = renderPlans;
+        return renderPlans;
+    }
+
+    private static List<PulsarFramePlan> BuildLegacyRenderSchedule(
+        IReadOnlyList<PulsarFramePlan> segmentPlans,
+        IReadOnlyList<PulsarTransientAnalysis> analyses,
+        int sampleCount)
+    {
+        if (segmentPlans.Count == 0 || sampleCount <= 0)
+        {
+            return new List<PulsarFramePlan>();
+        }
+
+        int totalQuanta = Math.Max(1, (sampleCount + LegacyRenderQuantum - 1) / LegacyRenderQuantum);
+        int initialHopQuanta = Math.Max(1, (segmentPlans[0].BlockSize / 2) / LegacyRenderQuantum);
+        int targetCoverageQuanta = totalQuanta + initialHopQuanta;
+        int quantaPerSegment = Math.Max(1, PulsarBlockLadder.ControlHopSize / LegacyRenderQuantum);
+        int timelineLength = Math.Max(targetCoverageQuanta, segmentPlans.Count * quantaPerSegment);
+        int[] desiredBlockSizes = new int[timelineLength];
+
+        for (int segmentIndex = 0; segmentIndex < segmentPlans.Count; segmentIndex++)
+        {
+            int blockSize = segmentPlans[segmentIndex].BlockSize;
+            int quantumStart = segmentIndex * quantaPerSegment;
+            for (int quantumOffset = 0; quantumOffset < quantaPerSegment && quantumStart + quantumOffset < desiredBlockSizes.Length; quantumOffset++)
+            {
+                desiredBlockSizes[quantumStart + quantumOffset] = blockSize;
+            }
+        }
+
+        int lastDesiredBlockSize = segmentPlans[^1].BlockSize;
+        for (int quantumIndex = 0; quantumIndex < desiredBlockSizes.Length; quantumIndex++)
+        {
+            if (desiredBlockSizes[quantumIndex] == 0)
+            {
+                desiredBlockSizes[quantumIndex] = lastDesiredBlockSize;
+            }
+        }
+
+        var frameStartQuanta = new List<int>();
+        var frameSizes = new List<int>();
+
+        int cursorQuantum = 0;
+        int? pendingBlockSize = null;
+        while (cursorQuantum < targetCoverageQuanta)
+        {
+            int currentBlockSize = pendingBlockSize ?? desiredBlockSizes[Math.Min(cursorQuantum, desiredBlockSizes.Length - 1)];
+            int runEndQuantum = cursorQuantum;
+            while (runEndQuantum < desiredBlockSizes.Length && desiredBlockSizes[runEndQuantum] == currentBlockSize)
+            {
+                runEndQuantum++;
+            }
+
+            int remainingRunQuanta = Math.Max(1, runEndQuantum - cursorQuantum);
+            int constantHopQuanta = GetLegacyRenderHopQuanta(currentBlockSize, currentBlockSize);
+            int upcomingBlockSize = runEndQuantum < desiredBlockSizes.Length ? desiredBlockSizes[runEndQuantum] : currentBlockSize;
+            bool approachingBoundary = remainingRunQuanta <= constantHopQuanta;
+            int targetHopQuanta = approachingBoundary ? remainingRunQuanta : constantHopQuanta;
+            int targetNextBlockSize = approachingBoundary ? upcomingBlockSize : currentBlockSize;
+
+            bool isFinalFrame = cursorQuantum + targetHopQuanta >= targetCoverageQuanta;
+            int nextBlockSize = isFinalFrame
+                ? currentBlockSize
+                : ChooseLegacyRenderNextBlockSize(currentBlockSize, targetNextBlockSize, targetHopQuanta);
+
+            frameStartQuanta.Add(cursorQuantum);
+            frameSizes.Add(currentBlockSize);
+
+            int hopQuanta = GetLegacyRenderHopQuanta(currentBlockSize, nextBlockSize);
+            cursorQuantum += hopQuanta;
+            pendingBlockSize = nextBlockSize;
+        }
+
+        var renderPlans = new List<PulsarFramePlan>(frameSizes.Count);
+        for (int frameIndex = 0; frameIndex < frameSizes.Count; frameIndex++)
+        {
+            int startQuantum = frameStartQuanta[frameIndex];
+            int analysisSegmentIndex = Math.Clamp((startQuantum * LegacyRenderQuantum) / PulsarBlockLadder.ControlHopSize, 0, segmentPlans.Count - 1);
+            PulsarFramePlan sourcePlan = segmentPlans[analysisSegmentIndex];
+            PulsarTransientAnalysis analysis = analyses.Count > 0
+                ? analyses[Math.Clamp(analysisSegmentIndex, 0, analyses.Count - 1)]
+                : new PulsarTransientAnalysis
+                {
+                    SegmentIndex = analysisSegmentIndex,
+                    Level = PulsarTransientLevel.None,
+                    AttackRatio = 0.0,
+                    PeakDeltaDb = 0.0,
+                    AttackIndex = 0,
+                    EnergyModulation = 0.0,
+                    CrestFactor = 0.0,
+                    LowBandRatio = 0.0,
+                    HighBandRatio = 0.0,
+                    SustainedHighBandRatio = 0.0,
+                    DesiredLadderPosition = 0.0,
+                    ClueStrength = 0.0,
+                    Spectral = new SpectralProfile(),
+                    PreEchoRisk = 0.0,
+                    SpectralFlux = 0.0,
+                };
+
+            int currentBlockSize = frameSizes[frameIndex];
+            int previousBlockSize = frameIndex == 0 ? currentBlockSize : frameSizes[frameIndex - 1];
+            int nextBlockSize = frameIndex == frameSizes.Count - 1 ? currentBlockSize : frameSizes[frameIndex + 1];
+            int previousStateIndex = Array.IndexOf(BlockSteps, previousBlockSize);
+            int currentStateIndex = Array.IndexOf(BlockSteps, currentBlockSize);
+
+            renderPlans.Add(new PulsarFramePlan
+            {
+                SegmentIndex = analysisSegmentIndex,
+                PreviousBlockSize = previousBlockSize,
+                BlockSize = currentBlockSize,
+                NextBlockSize = nextBlockSize,
+                TargetBlockSize = sourcePlan.TargetBlockSize,
+                Direction = DirFromIndex(DirFromDelta(currentStateIndex - previousStateIndex)),
+                TransientLevel = analysis.Level,
+                AttackRatio = analysis.AttackRatio,
+                PeakDeltaDb = analysis.PeakDeltaDb,
+                AttackIndex = analysis.AttackIndex,
+                EnergyModulation = analysis.EnergyModulation,
+                CrestFactor = analysis.CrestFactor,
+                LowBandRatio = analysis.LowBandRatio,
+                HighBandRatio = analysis.HighBandRatio,
+                SustainedHighBandRatio = analysis.SustainedHighBandRatio,
+                DesiredLadderPosition = analysis.DesiredLadderPosition,
+                ClueStrength = analysis.ClueStrength,
+                PathCost = sourcePlan.PathCost,
+                Spectral = analysis.Spectral,
+                PreEchoRisk = analysis.PreEchoRisk,
+                SpectralFlux = analysis.SpectralFlux,
+            });
+        }
+
+        return renderPlans;
+    }
+
+    private static int ChooseLegacyRenderNextBlockSize(int currentBlockSize, int targetNextBlockSize, int targetHopQuanta)
+    {
+        int currentStateIndex = Array.IndexOf(BlockSteps, currentBlockSize);
+        int targetNextStateIndex = Array.IndexOf(BlockSteps, targetNextBlockSize);
+        int bestBlockSize = currentBlockSize;
+        double bestScore = double.PositiveInfinity;
+
+        foreach (int candidateBlockSize in BlockSteps)
+        {
+            int hopQuanta = GetLegacyRenderHopQuanta(currentBlockSize, candidateBlockSize);
+            int candidateStateIndex = Array.IndexOf(BlockSteps, candidateBlockSize);
+            double score = (Math.Abs(hopQuanta - targetHopQuanta) * 8.0)
+                + (Math.Abs(candidateStateIndex - targetNextStateIndex) * 2.5)
+                + (Math.Abs(candidateStateIndex - currentStateIndex) * 0.35);
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestBlockSize = candidateBlockSize;
+            }
+        }
+
+        return bestBlockSize;
+    }
+
+    private static int GetLegacyRenderHopQuanta(int currentBlockSize, int nextBlockSize)
+    {
+        int rightOverlap = Math.Min(currentBlockSize / 2, nextBlockSize / 2);
+        int hopSize = currentBlockSize - rightOverlap;
+        return Math.Max(1, hopSize / LegacyRenderQuantum);
     }
 
     // ═════════════════════════════════════════════════════════════

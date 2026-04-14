@@ -1,14 +1,79 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
-using System.Threading.Tasks;
 using System.Numerics;
 
 public static class PulsarTransformEngine
 {
     private static readonly ConcurrentDictionary<(int size, int prevSize, int nextSize), float[]> WindowCache = new();
-    private static readonly ConcurrentDictionary<int, float[]> MdctKernelCache = new();
-    private static readonly ConcurrentDictionary<int, float[]> ImdctKernelCache = new();
+    private static readonly ConcurrentDictionary<int, ComplexFftPlan> ComplexFftPlanCache = new();
+    private static readonly ConcurrentDictionary<int, Dct4Plan> Dct4PlanCache = new();
+
+    private sealed class ComplexFftPlan
+    {
+        public required int Size { get; init; }
+        public required int[] BitReverse { get; init; }
+        public required double[] StageMulReal { get; init; }
+        public required double[] StageMulImag { get; init; }
+    }
+
+    private sealed class Dct4Plan
+    {
+        public required int Size { get; init; }
+        public required int FftSize { get; init; }
+        public required ComplexFftPlan FftPlan { get; init; }
+        public required double[] PreCos { get; init; }
+        public required double[] PreSin { get; init; }
+        public required double[] KernelFftReal { get; init; }
+        public required double[] KernelFftImag { get; init; }
+    }
+
+    private sealed class TransformWorkspace
+    {
+        public float[] FoldedInput = Array.Empty<float>();
+        public float[] FoldedOutput = Array.Empty<float>();
+        public float[] Spectrum = Array.Empty<float>();
+        public float[] TimeBlock = Array.Empty<float>();
+        public double[] FftReal = Array.Empty<double>();
+        public double[] FftImag = Array.Empty<double>();
+
+        public void EnsureTransformSize(int size)
+        {
+            if (FoldedInput.Length < size)
+            {
+                FoldedInput = new float[size];
+            }
+
+            if (FoldedOutput.Length < size)
+            {
+                FoldedOutput = new float[size];
+            }
+
+            if (Spectrum.Length < size)
+            {
+                Spectrum = new float[size];
+            }
+
+            int blockSize = size * 2;
+            if (TimeBlock.Length < blockSize)
+            {
+                TimeBlock = new float[blockSize];
+            }
+        }
+
+        public void EnsureFftSize(int size)
+        {
+            if (FftReal.Length < size)
+            {
+                FftReal = new double[size];
+            }
+
+            if (FftImag.Length < size)
+            {
+                FftImag = new double[size];
+            }
+        }
+    }
 
     static PulsarTransformEngine()
     {
@@ -21,7 +86,7 @@ public static class PulsarTransformEngine
         ArgumentNullException.ThrowIfNull(planner);
 
         var framePlans = planner.PlanSong(input, null);
-        return RenderSequentialPath(input, framePlans);
+        return RenderPlannerCompatiblePath(input, framePlans);
     }
 
     public static (float[] Output, List<PulsarFramePlan> Plans) ProcessWithPlans(float[] input, PulsarPlanner planner)
@@ -30,7 +95,7 @@ public static class PulsarTransformEngine
         ArgumentNullException.ThrowIfNull(planner);
 
         var framePlans = planner.PlanSong(input, null);
-        return (RenderSequentialPath(input, framePlans), framePlans);
+        return (RenderPlannerCompatiblePath(input, framePlans), framePlans);
     }
 
     public static float[] ProcessLegacyPlanner(float[] input, PulsarPlanner planner)
@@ -38,8 +103,8 @@ public static class PulsarTransformEngine
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(planner);
 
-        var framePlans = planner.PlanSong(input, null);
-        return RenderSequentialPath(input, framePlans);
+        var framePlans = planner.PlanLegacyRenderSong(input, null);
+        return RenderExplicitPlannerPath(input, framePlans);
     }
 
     public static float[] ProcessWithBitAllocation(
@@ -70,49 +135,74 @@ public static class PulsarTransformEngine
             throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Legacy block size must be a valid ladder step.");
         }
 
-        // Für Legacy erstellen wir einfach einen Dummy-Plan, der stur auf der BlockSize bleibt
-        int segmentCount = (input.Length + PulsarBlockLadder.ControlHopSize - 1) / PulsarBlockLadder.ControlHopSize;
-        var dummyPlans = new List<PulsarFramePlan>(segmentCount);
-        for(int i=0; i<segmentCount; i++)
-        {
-            dummyPlans.Add(new PulsarFramePlan {
-                 SegmentIndex = i, BlockSize = blockSize, PreviousBlockSize = blockSize, NextBlockSize = blockSize,
-                 TargetBlockSize = blockSize, Direction = PulsarSwitchDirection.Hold,
-                 TransientLevel = PulsarTransientLevel.None, AttackRatio = 0, PeakDeltaDb = 0,
-                 AttackIndex = 0, EnergyModulation = 0, CrestFactor = 0, LowBandRatio = 0,
-                 HighBandRatio = 0, SustainedHighBandRatio = 0, DesiredLadderPosition = 0,
-                 ClueStrength = 0, PathCost = 0, Spectral = new SpectralProfile(), PreEchoRisk = 0, SpectralFlux = 0
-            });
-        }
-
-        return RenderSequentialPath(input, dummyPlans);
+        return RenderConstantBlockPath(input, blockSize);
     }
 
-    // --- DIE NEUE SEQUENZIELLE MASTER-SCHLEIFE ---
-    private static float[] RenderSequentialPath(float[] input, IReadOnlyList<PulsarFramePlan> framePlans)
+    private static float[] RenderConstantBlockPath(float[] input, int blockSize)
+    {
+        if (input.Length == 0) return Array.Empty<float>();
+
+        int hopSize = blockSize / 2;
+        int alignedInputLength = ((input.Length + hopSize - 1) / hopSize) * hopSize;
+        int transformSize = blockSize / 2;
+
+        float[] paddedInput = new float[alignedInputLength + hopSize * 2];
+        Array.Copy(input, 0, paddedInput, hopSize, input.Length);
+
+        float[] output = new float[paddedInput.Length + blockSize];
+        float[] overlapBuffer = new float[blockSize];
+        float[] window = GetWindow(blockSize, blockSize, blockSize);
+        Dct4Plan plan = GetDct4Plan(transformSize);
+        var workspace = new TransformWorkspace();
+        workspace.EnsureTransformSize(transformSize);
+        workspace.EnsureFftSize(plan.FftSize);
+
+        int currentInputPos = 0;
+        int currentOutputPos = 0;
+        int overlapCount = 0;
+        while (currentInputPos + blockSize <= paddedInput.Length)
+        {
+            BuildMdctFoldedInput(paddedInput, currentInputPos, window, workspace.FoldedInput, blockSize);
+            ComputeDct4(workspace.FoldedInput, workspace.Spectrum, plan, workspace);
+            ComputeInverseDct4(workspace.Spectrum, workspace.FoldedOutput, plan, workspace);
+            OverlapAddSynthesizedBlock(workspace.FoldedOutput, transformSize, window, output, currentOutputPos, overlapBuffer, hopSize, hopSize, overlapCount);
+
+            currentInputPos += hopSize;
+            currentOutputPos += hopSize;
+            overlapCount = hopSize;
+        }
+
+        float[] trimmed = new float[input.Length];
+        Array.Copy(output, hopSize, trimmed, 0, input.Length);
+        return trimmed;
+    }
+
+    private static float[] RenderPlannerCompatiblePath(float[] input, IReadOnlyList<PulsarFramePlan> framePlans)
     {
         if (framePlans.Count == 0 || input.Length == 0) return Array.Empty<float>();
 
         int initialBlockSize = framePlans[0].BlockSize;
         int initialHop = initialBlockSize / 2;
+        int alignedInputLength = ((input.Length + PulsarBlockLadder.ControlHopSize - 1) / PulsarBlockLadder.ControlHopSize) * PulsarBlockLadder.ControlHopSize;
 
-        float[] paddedInput = new float[input.Length + initialHop * 2];
+        float[] paddedInput = new float[alignedInputLength + initialHop * 2];
         Array.Copy(input, 0, paddedInput, initialHop, input.Length);
 
         float[] output = new float[paddedInput.Length + PulsarBlockLadder.MaxBlockSize];
         float[] overlapBuffer = new float[PulsarBlockLadder.MaxBlockSize];
+        var workspace = new TransformWorkspace();
 
         int currentInputPos = 0;
         int currentOutputPos = 0;
-        int previousBlockSize = initialBlockSize;
+        int overlapCount = 0;
 
         while (currentInputPos < paddedInput.Length - PulsarBlockLadder.MinBlockSize)
         {
             int unpaddedPos = currentInputPos - initialHop;
-            int segmentIndex = unpaddedPos >= 0 ? (unpaddedPos / PulsarBlockLadder.ControlHopSize) : 0;
-            segmentIndex = Math.Clamp(segmentIndex, 0, framePlans.Count - 1);
-
-            int currentBlockSize = framePlans[segmentIndex].BlockSize;
+            PulsarFramePlan currentPlan = ResolvePlannerRenderPlan(framePlans, unpaddedPos);
+            int currentBlockSize = currentPlan.BlockSize;
+            int previousBlockSize = currentPlan.PreviousBlockSize;
+            int nextBlockSize = currentPlan.NextBlockSize;
 
             if (currentInputPos + currentBlockSize > paddedInput.Length)
             {
@@ -120,51 +210,39 @@ public static class PulsarTransformEngine
                 while (currentInputPos + currentBlockSize > paddedInput.Length && currentBlockSize > 2)
                     currentBlockSize /= 2;
                 if (currentBlockSize < PulsarBlockLadder.MinBlockSize) break;
+
+                previousBlockSize = Math.Min(previousBlockSize, currentBlockSize);
+                nextBlockSize = Math.Min(nextBlockSize, currentBlockSize);
             }
 
-            int nextUnpaddedPos = unpaddedPos + (currentBlockSize / 2);
-            int nextSegmentIndex = nextUnpaddedPos >= 0 ? (nextUnpaddedPos / PulsarBlockLadder.ControlHopSize) : 0;
-            nextSegmentIndex = Math.Clamp(nextSegmentIndex, 0, framePlans.Count - 1);
-            int nextBlockSize = framePlans[nextSegmentIndex].BlockSize;
-
-            int leftOverlap = Math.Clamp(previousBlockSize / 2, 1, currentBlockSize - 1);
-            int rightOverlap = Math.Clamp(nextBlockSize / 2, 1, currentBlockSize - leftOverlap);
+            ComputeAsymmetricOverlap(currentBlockSize, previousBlockSize, nextBlockSize, out int leftOverlap, out int rightOverlap);
             int flatEnd = currentBlockSize - rightOverlap;
 
-            float[] frame = new float[currentBlockSize];
-            int available = Math.Min(currentBlockSize, paddedInput.Length - currentInputPos);
-            Array.Copy(paddedInput, currentInputPos, frame, 0, available);
-
             float[] window = GetWindow(currentBlockSize, previousBlockSize, nextBlockSize);
-            ApplyWindow(frame, window);
 
-            float[] spectrum = new float[currentBlockSize / 2];
-            float[] reconstructed = new float[currentBlockSize];
-            Mdct(frame, spectrum);
-            Imdct(spectrum, reconstructed);
-            ApplyWindow(reconstructed, window);
+            Dct4Plan plan = GetDct4Plan(currentBlockSize / 2);
+            workspace.EnsureTransformSize(plan.Size);
+            workspace.EnsureFftSize(plan.FftSize);
 
-            for (int i = 0; i < currentBlockSize; i++)
+            BuildMdctFoldedInput(paddedInput, currentInputPos, window, workspace.FoldedInput, currentBlockSize);
+            ComputeDct4(workspace.FoldedInput, workspace.Spectrum, plan, workspace);
+            ComputeInverseDct4(workspace.Spectrum, workspace.FoldedOutput, plan, workspace);
+
+            if (leftOverlap == plan.Size && rightOverlap == plan.Size)
             {
-                int outIndex = currentOutputPos + i;
-                if (i < leftOverlap)
-                {
-                    output[outIndex] = reconstructed[i] + overlapBuffer[i];
-                }
-                else if (i < flatEnd)
-                {
-                    output[outIndex] = reconstructed[i];
-                }
-                else
-                {
-                    overlapBuffer[i - flatEnd] = reconstructed[i];
-                }
+                OverlapAddSynthesizedBlock(workspace.FoldedOutput, plan.Size, window, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
+            }
+            else
+            {
+                ExpandFoldedImdct(workspace.FoldedOutput, plan.Size, workspace.TimeBlock);
+                ApplyWindow(workspace.TimeBlock, currentBlockSize, window);
+                OverlapAddMaterializedBlock(workspace.TimeBlock, currentBlockSize, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
             }
 
             int hopSize = flatEnd;
             currentInputPos += hopSize;
             currentOutputPos += hopSize;
-            previousBlockSize = currentBlockSize;
+            overlapCount = rightOverlap;
         }
 
         float[] trimmed = new float[input.Length];
@@ -173,6 +251,106 @@ public static class PulsarTransformEngine
             Array.Copy(output, initialHop, trimmed, 0, copyLength);
 
         return trimmed;
+    }
+
+    private static float[] RenderExplicitPlannerPath(float[] input, IReadOnlyList<PulsarFramePlan> framePlans)
+    {
+        if (framePlans.Count == 0 || input.Length == 0) return Array.Empty<float>();
+
+        int initialBlockSize = framePlans[0].BlockSize;
+        int initialHop = initialBlockSize / 2;
+        int alignQuantum = PulsarBlockLadder.MinBlockSize / 2;
+        int alignedInputLength = ((input.Length + alignQuantum - 1) / alignQuantum) * alignQuantum;
+        int targetOutputCoverage = alignedInputLength + initialHop;
+
+        float[] paddedInput = new float[alignedInputLength + (PulsarBlockLadder.MaxBlockSize * 2)];
+        Array.Copy(input, 0, paddedInput, initialHop, input.Length);
+
+        float[] output = new float[paddedInput.Length + PulsarBlockLadder.MaxBlockSize];
+        float[] overlapBuffer = new float[PulsarBlockLadder.MaxBlockSize];
+        var workspace = new TransformWorkspace();
+
+        int currentInputPos = 0;
+        int currentOutputPos = 0;
+        int overlapCount = 0;
+
+        foreach (PulsarFramePlan framePlan in framePlans)
+        {
+            int currentBlockSize = framePlan.BlockSize;
+            int previousBlockSize = framePlan.PreviousBlockSize;
+            int nextBlockSize = framePlan.NextBlockSize;
+
+            if (currentInputPos + currentBlockSize > paddedInput.Length)
+            {
+                break;
+            }
+
+            ComputeAsymmetricOverlap(currentBlockSize, previousBlockSize, nextBlockSize, out int leftOverlap, out int rightOverlap);
+            int flatEnd = currentBlockSize - rightOverlap;
+            float[] window = GetWindow(currentBlockSize, previousBlockSize, nextBlockSize);
+
+            Dct4Plan plan = GetDct4Plan(currentBlockSize / 2);
+            workspace.EnsureTransformSize(plan.Size);
+            workspace.EnsureFftSize(plan.FftSize);
+
+            BuildMdctFoldedInput(paddedInput, currentInputPos, window, workspace.FoldedInput, currentBlockSize);
+            ComputeDct4(workspace.FoldedInput, workspace.Spectrum, plan, workspace);
+            ComputeInverseDct4(workspace.Spectrum, workspace.FoldedOutput, plan, workspace);
+
+            if (leftOverlap == plan.Size && rightOverlap == plan.Size)
+            {
+                OverlapAddSynthesizedBlock(workspace.FoldedOutput, plan.Size, window, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
+            }
+            else
+            {
+                ExpandFoldedImdct(workspace.FoldedOutput, plan.Size, workspace.TimeBlock);
+                ApplyWindow(workspace.TimeBlock, currentBlockSize, window);
+                OverlapAddMaterializedBlock(workspace.TimeBlock, currentBlockSize, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
+            }
+
+            currentInputPos += flatEnd;
+            currentOutputPos += flatEnd;
+            overlapCount = rightOverlap;
+
+            if (currentOutputPos >= targetOutputCoverage)
+            {
+                break;
+            }
+        }
+
+        float[] trimmed = new float[input.Length];
+        int copyLength = Math.Min(input.Length, output.Length - initialHop);
+        if (copyLength > 0)
+        {
+            Array.Copy(output, initialHop, trimmed, 0, copyLength);
+        }
+
+        return trimmed;
+    }
+
+    private static PulsarFramePlan ResolvePlannerRenderPlan(IReadOnlyList<PulsarFramePlan> framePlans, int unpaddedPos)
+    {
+        int controlHop = PulsarBlockLadder.ControlHopSize;
+        int segmentIndex = unpaddedPos >= 0 ? (unpaddedPos / controlHop) : 0;
+        segmentIndex = Math.Clamp(segmentIndex, 0, framePlans.Count - 1);
+
+        PulsarFramePlan resolvedPlan = framePlans[segmentIndex];
+        for (int iteration = 0; iteration < 2; iteration++)
+        {
+            int centerPos = unpaddedPos + (resolvedPlan.BlockSize / 2);
+            int centerSegmentIndex = centerPos >= 0 ? (centerPos / controlHop) : 0;
+            centerSegmentIndex = Math.Clamp(centerSegmentIndex, 0, framePlans.Count - 1);
+
+            PulsarFramePlan centeredPlan = framePlans[centerSegmentIndex];
+            if (ReferenceEquals(centeredPlan, resolvedPlan))
+            {
+                break;
+            }
+
+            resolvedPlan = centeredPlan;
+        }
+
+        return resolvedPlan;
     }
 
     // --- DIE QUANTISIERTE SEQUENZIELLE MASTER-SCHLEIFE ---
@@ -186,80 +364,68 @@ public static class PulsarTransformEngine
 
         int initialBlockSize = framePlans[0].BlockSize;
         int initialHop = initialBlockSize / 2;
+        int alignQuantum = PulsarBlockLadder.MinBlockSize / 2;
+        int alignedInputLength = ((input.Length + alignQuantum - 1) / alignQuantum) * alignQuantum;
+        int targetOutputCoverage = alignedInputLength + initialHop;
 
-        float[] paddedInput = new float[input.Length + initialHop * 2];
+        float[] paddedInput = new float[alignedInputLength + (PulsarBlockLadder.MaxBlockSize * 2)];
         Array.Copy(input, 0, paddedInput, initialHop, input.Length);
 
         float[] output = new float[paddedInput.Length + PulsarBlockLadder.MaxBlockSize];
         float[] overlapBuffer = new float[PulsarBlockLadder.MaxBlockSize];
+        var workspace = new TransformWorkspace();
 
         int currentInputPos = 0;
         int currentOutputPos = 0;
-        int previousBlockSize = initialBlockSize;
+        int overlapCount = 0;
 
-        while (currentInputPos < paddedInput.Length - PulsarBlockLadder.MinBlockSize)
+        foreach (PulsarFramePlan framePlan in framePlans)
         {
-            int unpaddedPos = currentInputPos - initialHop;
-            int segmentIndex = unpaddedPos >= 0 ? (unpaddedPos / PulsarBlockLadder.ControlHopSize) : 0;
-            segmentIndex = Math.Clamp(segmentIndex, 0, framePlans.Count - 1);
-
-            int currentBlockSize = framePlans[segmentIndex].BlockSize;
+            int currentBlockSize = framePlan.BlockSize;
+            int previousBlockSize = framePlan.PreviousBlockSize;
+            int nextBlockSize = framePlan.NextBlockSize;
 
             if (currentInputPos + currentBlockSize > paddedInput.Length)
             {
-                currentBlockSize = PulsarBlockLadder.MinBlockSize;
-                while (currentInputPos + currentBlockSize > paddedInput.Length && currentBlockSize > 2)
-                    currentBlockSize /= 2;
-                if (currentBlockSize < PulsarBlockLadder.MinBlockSize) break;
+                break;
             }
 
-            int nextUnpaddedPos = unpaddedPos + (currentBlockSize / 2);
-            int nextSegmentIndex = nextUnpaddedPos >= 0 ? (nextUnpaddedPos / PulsarBlockLadder.ControlHopSize) : 0;
-            nextSegmentIndex = Math.Clamp(nextSegmentIndex, 0, framePlans.Count - 1);
-            int nextBlockSize = framePlans[nextSegmentIndex].BlockSize;
-
-            int leftOverlap = Math.Clamp(previousBlockSize / 2, 1, currentBlockSize - 1);
-            int rightOverlap = Math.Clamp(nextBlockSize / 2, 1, currentBlockSize - leftOverlap);
+            ComputeAsymmetricOverlap(currentBlockSize, previousBlockSize, nextBlockSize, out int leftOverlap, out int rightOverlap);
             int flatEnd = currentBlockSize - rightOverlap;
 
-            float[] frame = new float[currentBlockSize];
-            int available = Math.Min(currentBlockSize, paddedInput.Length - currentInputPos);
-            Array.Copy(paddedInput, currentInputPos, frame, 0, available);
-
             float[] window = GetWindow(currentBlockSize, previousBlockSize, nextBlockSize);
-            ApplyWindow(frame, window);
 
-            float[] spectrum = new float[currentBlockSize / 2];
-            float[] reconstructed = new float[currentBlockSize];
-            Mdct(frame, spectrum);
+            Dct4Plan plan = GetDct4Plan(currentBlockSize / 2);
+            workspace.EnsureTransformSize(plan.Size);
+            workspace.EnsureFftSize(plan.FftSize);
 
-            var quantContext = BuildQuantizationContext(Math.Max(0, unpaddedPos), currentBlockSize, allocations, psychoFrames);
-            PulsarQuantizer.QuantizeSpectrum(spectrum, quantContext.BandBits, quantContext.Psycho);
+            BuildMdctFoldedInput(paddedInput, currentInputPos, window, workspace.FoldedInput, currentBlockSize);
+            ComputeDct4(workspace.FoldedInput, workspace.Spectrum, plan, workspace);
 
-            Imdct(spectrum, reconstructed);
-            ApplyWindow(reconstructed, window);
+            var quantContext = BuildQuantizationContext(currentInputPos, currentBlockSize, allocations, psychoFrames);
+            PulsarQuantizer.QuantizeSpectrum(workspace.Spectrum, quantContext.BandBits, quantContext.Psycho);
 
-            for (int i = 0; i < currentBlockSize; i++)
+            ComputeInverseDct4(workspace.Spectrum, workspace.FoldedOutput, plan, workspace);
+
+            if (leftOverlap == plan.Size && rightOverlap == plan.Size)
             {
-                int outIndex = currentOutputPos + i;
-                if (i < leftOverlap)
-                {
-                    output[outIndex] = reconstructed[i] + overlapBuffer[i];
-                }
-                else if (i < flatEnd)
-                {
-                    output[outIndex] = reconstructed[i];
-                }
-                else
-                {
-                    overlapBuffer[i - flatEnd] = reconstructed[i];
-                }
+                OverlapAddSynthesizedBlock(workspace.FoldedOutput, plan.Size, window, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
+            }
+            else
+            {
+                ExpandFoldedImdct(workspace.FoldedOutput, plan.Size, workspace.TimeBlock);
+                ApplyWindow(workspace.TimeBlock, currentBlockSize, window);
+                OverlapAddMaterializedBlock(workspace.TimeBlock, currentBlockSize, output, currentOutputPos, overlapBuffer, leftOverlap, flatEnd, overlapCount);
             }
 
-            int hopSize = flatEnd;
-            currentInputPos += hopSize;
-            currentOutputPos += hopSize;
-            previousBlockSize = currentBlockSize;
+            currentInputPos += flatEnd;
+            currentOutputPos += flatEnd;
+            overlapCount = rightOverlap;
+
+            if (currentOutputPos >= targetOutputCoverage)
+            {
+                break;
+            }
         }
 
         float[] trimmed = new float[input.Length];
@@ -298,8 +464,7 @@ public static class PulsarTransformEngine
     // --- ASYMMETRISCHE FENSTER GENERIERUNG (SIMD-Optimiert) ---
     private static float[] BuildAsymmetricWindow(int size, int prevSize, int nextSize)
     {
-        int leftOverlap = Math.Clamp(prevSize / 2, 1, size - 1);
-        int rightOverlap = Math.Clamp(nextSize / 2, 1, size - leftOverlap);
+        ComputeAsymmetricOverlap(size, prevSize, nextSize, out int leftOverlap, out int rightOverlap);
         int flatEnd = size - rightOverlap;
 
         float[] window = new float[size];
@@ -313,12 +478,18 @@ public static class PulsarTransformEngine
             var halfVector = new Vector<float>(0.5f);
             var leftDenom = new Vector<float>(twoLeftOverlap);
             var rightDenom = new Vector<float>(twoRightOverlap);
+            float[] laneOffsetsArray = new float[vectorSize];
+            for (int lane = 0; lane < vectorSize; lane++)
+            {
+                laneOffsetsArray[lane] = lane;
+            }
+            var laneOffsets = new Vector<float>(laneOffsetsArray);
             float[] temp = new float[vectorSize];
 
             int i = 0;
             for (; i <= leftOverlap - vectorSize && i < size; i += vectorSize)
             {
-                var baseIndex = new Vector<float>(i);
+                var baseIndex = new Vector<float>(i) + laneOffsets;
                 var arg = (baseIndex + halfVector) * (piVector / leftDenom);
                 arg.CopyTo(temp);
                 for (int lane = 0; lane < vectorSize; lane++)
@@ -339,7 +510,7 @@ public static class PulsarTransformEngine
             i = 0;
             for (; i <= rightOverlap - vectorSize && flatEnd + i + vectorSize <= size; i += vectorSize)
             {
-                var baseIndex = new Vector<float>(i);
+                var baseIndex = new Vector<float>(i) + laneOffsets;
                 var arg = (baseIndex + halfVector) * (piVector / rightDenom);
                 arg.CopyTo(temp);
                 for (int lane = 0; lane < vectorSize; lane++)
@@ -371,6 +542,15 @@ public static class PulsarTransformEngine
         }
 
         return window;
+    }
+
+    private static void ComputeAsymmetricOverlap(int currentBlockSize, int previousBlockSize, int nextBlockSize, out int leftOverlap, out int rightOverlap)
+    {
+        // FIX: Radikal vereinfacht.
+        // MDCT-TDAC erfordert ZWINGEND, dass die Überlappung zwischen Block N und N+1 exakt gleich ist.
+        // Der alte Clamp-Code hat bei 50% Overlap versehentlich um 1 Sample gekürzt und die Symmetrie zerstört.
+        leftOverlap = Math.Min(previousBlockSize / 2, currentBlockSize / 2);
+        rightOverlap = Math.Min(currentBlockSize / 2, nextBlockSize / 2);
     }
 
     private static float[] GetWindow(int size, int prevSize, int nextSize)
@@ -412,6 +592,34 @@ public static class PulsarTransformEngine
         }
     }
 
+    private static void ApplyWindow(float[] data, int length, float[] window)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        ArgumentNullException.ThrowIfNull(window);
+
+        if (length < 0 || length > data.Length || length != window.Length)
+        {
+            throw new ArgumentException("Window length must match the logical target buffer length.", nameof(window));
+        }
+
+        int i = 0;
+        if (Vector.IsHardwareAccelerated)
+        {
+            int vectorSize = Vector<float>.Count;
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                var vData = new Vector<float>(data, i);
+                var vWindow = new Vector<float>(window, i);
+                (vData * vWindow).CopyTo(data, i);
+            }
+        }
+
+        for (; i < length; i++)
+        {
+            data[i] *= window[i];
+        }
+    }
+
     public static float[] Mdct(float[] input)
     {
         int n2 = input.Length;
@@ -423,41 +631,21 @@ public static class PulsarTransformEngine
 
     public static void Mdct(float[] input, float[] output)
     {
-        int n2 = input.Length;
-        int n = n2 / 2;
-        float[] kernel = GetMdctKernel(n2);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
 
-        Parallel.For(0, n, k =>
+        if (input.Length != output.Length * 2 || (input.Length & 3) != 0)
         {
-            double sum = 0.0;
-            int kernelOffset = k * n2;
-            int i = 0;
+            throw new ArgumentException("MDCT input length must be exactly twice the output length and divisible by four.");
+        }
 
-            if (Vector.IsHardwareAccelerated)
-            {
-                int vectorSize = Vector<float>.Count;
-                Vector<float> vSum = Vector<float>.Zero;
-                
-                for (; i <= n2 - vectorSize; i += vectorSize)
-                {
-                    var vInput = new Vector<float>(input, i);
-                    var vKernel = new Vector<float>(kernel, kernelOffset + i);
-                    vSum += vInput * vKernel; 
-                }
-                
-                for (int v = 0; v < vectorSize; v++)
-                {
-                    sum += vSum[v];
-                }
-            }
+        Dct4Plan plan = GetDct4Plan(output.Length);
+        var workspace = new TransformWorkspace();
+        workspace.EnsureTransformSize(plan.Size);
+        workspace.EnsureFftSize(plan.FftSize);
 
-            for (; i < n2; i++)
-            {
-                sum += input[i] * kernel[kernelOffset + i];
-            }
-
-            output[k] = (float)sum;
-        });
+        BuildMdctFoldedInput(input, 0, null, workspace.FoldedInput, input.Length);
+        ComputeDct4(workspace.FoldedInput, output, plan, workspace);
     }
 
     public static float[] Imdct(float[] input)
@@ -471,86 +659,359 @@ public static class PulsarTransformEngine
 
     public static void Imdct(float[] input, float[] output)
     {
-        int n = input.Length;
-        int n2 = n * 2;
-        float[] kernel = GetImdctKernel(n2);
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(output);
 
-        Parallel.For(0, n2, i =>
+        if (output.Length != input.Length * 2 || (output.Length & 3) != 0)
         {
-            double sum = 0.0;
-            int kernelOffset = i * n;
-            int k = 0;
+            throw new ArgumentException("IMDCT output length must be exactly twice the input length and divisible by four.");
+        }
 
-            if (Vector.IsHardwareAccelerated)
+        Dct4Plan plan = GetDct4Plan(input.Length);
+        var workspace = new TransformWorkspace();
+        workspace.EnsureTransformSize(plan.Size);
+        workspace.EnsureFftSize(plan.FftSize);
+
+        ComputeInverseDct4(input, workspace.FoldedOutput, plan, workspace);
+        ExpandFoldedImdct(workspace.FoldedOutput, output);
+    }
+
+    private static void BuildMdctFoldedInput(float[] input, int inputOffset, float[]? window, float[] folded, int blockSize)
+    {
+        int halfSize = blockSize / 2;
+        int quarterSize = halfSize / 2;
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            int aIndex = inputOffset + i;
+            int bIndex = inputOffset + halfSize - 1 - i;
+            int cIndex = inputOffset + (halfSize + quarterSize - 1 - i);
+            int dIndex = inputOffset + (halfSize + quarterSize + i);
+
+            float a = input[aIndex];
+            float b = input[bIndex];
+            float c = input[cIndex];
+            float d = input[dIndex];
+
+            if (window is not null)
             {
-                int vectorSize = Vector<float>.Count;
-                Vector<float> vSum = Vector<float>.Zero;
-                
-                for (; k <= n - vectorSize; k += vectorSize)
-                {
-                    var vInput = new Vector<float>(input, k);
-                    var vKernel = new Vector<float>(kernel, kernelOffset + k);
-                    vSum += vInput * vKernel;
-                }
-                
-                for (int v = 0; v < vectorSize; v++)
-                {
-                    sum += vSum[v];
-                }
+                a *= window[i];
+                b *= window[halfSize - 1 - i];
+                c *= window[halfSize + quarterSize - 1 - i];
+                d *= window[halfSize + quarterSize + i];
             }
 
-            for (; k < n; k++)
+            folded[i] = -(d + c);
+            folded[quarterSize + i] = a - b;
+        }
+    }
+
+    private static void ExpandFoldedImdct(float[] folded, float[] output)
+    {
+        ExpandFoldedImdct(folded, folded.Length, output);
+    }
+
+    private static void ExpandFoldedImdct(float[] folded, int transformSize, float[] output)
+    {
+        int halfSize = transformSize;
+        int quarterSize = halfSize / 2;
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            output[i] = folded[quarterSize + i];
+            output[quarterSize + i] = -folded[halfSize - 1 - i];
+            output[halfSize + i] = -folded[quarterSize - 1 - i];
+            output[halfSize + quarterSize + i] = -folded[i];
+        }
+    }
+
+    private static void OverlapAddMaterializedBlock(
+        float[] block,
+        int blockSize,
+        float[] output,
+        int outputOffset,
+        float[] overlapBuffer,
+        int leftOverlap,
+        int flatEnd,
+        int overlapCount)
+    {
+        for (int i = 0; i < blockSize; i++)
+        {
+            int outIndex = outputOffset + i;
+            if (i < leftOverlap)
             {
-                sum += input[k] * kernel[kernelOffset + k];
+                output[outIndex] = block[i] + ((i < overlapCount) ? overlapBuffer[i] : 0f);
+            }
+            else if (i < flatEnd)
+            {
+                output[outIndex] = block[i];
+            }
+            else
+            {
+                overlapBuffer[i - flatEnd] = block[i];
+            }
+        }
+    }
+
+    private static void AccumulateBlock(float[] block, int blockSize, float[] output, int outputOffset)
+    {
+        for (int i = 0; i < blockSize; i++)
+        {
+            output[outputOffset + i] += block[i];
+        }
+    }
+
+    private static void OverlapAddSynthesizedBlock(
+        float[] folded,
+        int transformSize,
+        float[] window,
+        float[] output,
+        int outputOffset,
+        float[] overlapBuffer,
+        int leftOverlap,
+        int flatEnd,
+        int overlapCount)
+    {
+        int halfSize = transformSize;
+        int quarterSize = halfSize / 2;
+        int outputIndex = 0;
+
+        void WriteSample(float sample)
+        {
+            int outIndex = outputOffset + outputIndex;
+            if (outputIndex < leftOverlap)
+            {
+                output[outIndex] = sample + ((outputIndex < overlapCount) ? overlapBuffer[outputIndex] : 0f);
+            }
+            else if (outputIndex < flatEnd)
+            {
+                output[outIndex] = sample;
+            }
+            else
+            {
+                overlapBuffer[outputIndex - flatEnd] = sample;
             }
 
-            output[i] = (float)(sum * 2.0 / n);
+            outputIndex++;
+        }
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            WriteSample(folded[quarterSize + i] * window[outputIndex]);
+        }
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            WriteSample(-folded[halfSize - 1 - i] * window[outputIndex]);
+        }
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            WriteSample(-folded[quarterSize - 1 - i] * window[outputIndex]);
+        }
+
+        for (int i = 0; i < quarterSize; i++)
+        {
+            WriteSample(-folded[i] * window[outputIndex]);
+        }
+    }
+
+    private static void ComputeDct4(float[] input, float[] output, Dct4Plan plan, TransformWorkspace workspace)
+    {
+        workspace.EnsureFftSize(plan.FftSize);
+        double[] real = workspace.FftReal;
+        double[] imag = workspace.FftImag;
+
+        Array.Clear(real, 0, plan.FftSize);
+        Array.Clear(imag, 0, plan.FftSize);
+
+        for (int i = 0; i < plan.Size; i++)
+        {
+            double value = input[i];
+            real[i] = value * plan.PreCos[i];
+            imag[i] = -value * plan.PreSin[i];
+        }
+
+        ComputeComplexFft(real, imag, plan.FftPlan, inverse: false);
+
+        for (int i = 0; i < plan.FftSize; i++)
+        {
+            double fftReal = real[i];
+            double fftImag = imag[i];
+            double kernelReal = plan.KernelFftReal[i];
+            double kernelImag = plan.KernelFftImag[i];
+            real[i] = (fftReal * kernelReal) - (fftImag * kernelImag);
+            imag[i] = (fftReal * kernelImag) + (fftImag * kernelReal);
+        }
+
+        ComputeComplexFft(real, imag, plan.FftPlan, inverse: true);
+
+        for (int i = 0; i < plan.Size; i++)
+        {
+            output[i] = (float)((real[i] * plan.PreCos[i]) + (imag[i] * plan.PreSin[i]));
+        }
+    }
+
+    private static void ComputeInverseDct4(float[] input, float[] output, Dct4Plan plan, TransformWorkspace workspace)
+    {
+        ComputeDct4(input, output, plan, workspace);
+
+        float scale = 2.0f / plan.Size;
+        for (int i = 0; i < plan.Size; i++)
+        {
+            output[i] *= scale;
+        }
+    }
+
+    private static ComplexFftPlan GetComplexFftPlan(int size)
+    {
+        return ComplexFftPlanCache.GetOrAdd(size, fftSize =>
+        {
+            int levels = 31 - BitOperations.LeadingZeroCount((uint)fftSize);
+            int[] bitReverse = new int[fftSize];
+            for (int i = 0; i < fftSize; i++)
+            {
+                bitReverse[i] = ReverseBits(i, levels);
+            }
+
+            double[] stageMulReal = new double[levels];
+            double[] stageMulImag = new double[levels];
+            int stageIndex = 0;
+            for (int currentSize = 2; currentSize <= fftSize; currentSize <<= 1, stageIndex++)
+            {
+                double theta = -2.0 * Math.PI / currentSize;
+                stageMulReal[stageIndex] = Math.Cos(theta);
+                stageMulImag[stageIndex] = Math.Sin(theta);
+            }
+
+            return new ComplexFftPlan
+            {
+                Size = fftSize,
+                BitReverse = bitReverse,
+                StageMulReal = stageMulReal,
+                StageMulImag = stageMulImag,
+            };
         });
     }
 
-    private static float[] GetMdctKernel(int n2)
+    private static Dct4Plan GetDct4Plan(int size)
     {
-        return MdctKernelCache.GetOrAdd(n2, BuildMdctKernel);
-    }
-
-    private static float[] GetImdctKernel(int n2)
-    {
-        return ImdctKernelCache.GetOrAdd(n2, BuildImdctKernel);
-    }
-
-    private static float[] BuildMdctKernel(int n2)
-    {
-        int n = n2 / 2;
-        double constant = Math.PI / n;
-        float[] kernel = new float[n * n2];
-
-        for (int k = 0; k < n; k++)
+        return Dct4PlanCache.GetOrAdd(size, dctSize =>
         {
-            int offset = k * n2;
-            for (int i = 0; i < n2; i++)
+            int fftSize = 1;
+            while (fftSize < (dctSize * 2) - 1)
             {
-                kernel[offset + i] = (float)Math.Cos(constant * (i + 0.5 + n / 2.0) * (k + 0.5));
+                fftSize <<= 1;
+            }
+
+            double[] preCos = new double[dctSize];
+            double[] preSin = new double[dctSize];
+            for (int i = 0; i < dctSize; i++)
+            {
+                double angle = Math.PI * (i + 0.5) * (i + 0.5) / (2.0 * dctSize);
+                preCos[i] = Math.Cos(angle);
+                preSin[i] = Math.Sin(angle);
+            }
+
+            double[] kernelFftReal = new double[fftSize];
+            double[] kernelFftImag = new double[fftSize];
+            kernelFftReal[0] = 1.0;
+
+            for (int i = 1; i < dctSize; i++)
+            {
+                double angle = Math.PI * i * i / (2.0 * dctSize);
+                double real = Math.Cos(angle);
+                double imag = Math.Sin(angle);
+                kernelFftReal[i] = real;
+                kernelFftImag[i] = imag;
+                kernelFftReal[fftSize - i] = real;
+                kernelFftImag[fftSize - i] = imag;
+            }
+
+            ComplexFftPlan fftPlan = GetComplexFftPlan(fftSize);
+            ComputeComplexFft(kernelFftReal, kernelFftImag, fftPlan, inverse: false);
+
+            return new Dct4Plan
+            {
+                Size = dctSize,
+                FftSize = fftSize,
+                FftPlan = fftPlan,
+                PreCos = preCos,
+                PreSin = preSin,
+                KernelFftReal = kernelFftReal,
+                KernelFftImag = kernelFftImag,
+            };
+        });
+    }
+
+    private static void ComputeComplexFft(double[] real, double[] imag, ComplexFftPlan plan, bool inverse)
+    {
+        int[] bitReverse = plan.BitReverse;
+        for (int i = 0; i < plan.Size; i++)
+        {
+            int j = bitReverse[i];
+            if (j > i)
+            {
+                (real[i], real[j]) = (real[j], real[i]);
+                (imag[i], imag[j]) = (imag[j], imag[i]);
             }
         }
 
-        return kernel;
-    }
-
-    private static float[] BuildImdctKernel(int n2)
-    {
-        int n = n2 / 2;
-        double constant = Math.PI / n;
-        float[] kernel = new float[n2 * n];
-
-        for (int i = 0; i < n2; i++)
+        int stageIndex = 0;
+        for (int size = 2; size <= plan.Size; size <<= 1, stageIndex++)
         {
-            int offset = i * n;
-            for (int k = 0; k < n; k++)
+            int halfSize = size >> 1;
+            double wMulReal = plan.StageMulReal[stageIndex];
+            double wMulImag = inverse ? -plan.StageMulImag[stageIndex] : plan.StageMulImag[stageIndex];
+
+            for (int start = 0; start < plan.Size; start += size)
             {
-                kernel[offset + k] = (float)Math.Cos(constant * (i + 0.5 + n / 2.0) * (k + 0.5));
+                double wReal = 1.0;
+                double wImag = 0.0;
+
+                for (int k = 0; k < halfSize; k++)
+                {
+                    int evenIndex = start + k;
+                    int oddIndex = evenIndex + halfSize;
+
+                    double oddReal = (real[oddIndex] * wReal) - (imag[oddIndex] * wImag);
+                    double oddImag = (real[oddIndex] * wImag) + (imag[oddIndex] * wReal);
+
+                    real[oddIndex] = real[evenIndex] - oddReal;
+                    imag[oddIndex] = imag[evenIndex] - oddImag;
+                    real[evenIndex] += oddReal;
+                    imag[evenIndex] += oddImag;
+
+                    double nextReal = (wReal * wMulReal) - (wImag * wMulImag);
+                    double nextImag = (wReal * wMulImag) + (wImag * wMulReal);
+                    wReal = nextReal;
+                    wImag = nextImag;
+                }
             }
         }
 
-        return kernel;
+        if (!inverse)
+        {
+            return;
+        }
+
+        double scale = 1.0 / plan.Size;
+        for (int i = 0; i < plan.Size; i++)
+        {
+            real[i] *= scale;
+            imag[i] *= scale;
+        }
+    }
+
+    private static int ReverseBits(int value, int bitCount)
+    {
+        int result = 0;
+        for (int i = 0; i < bitCount; i++)
+        {
+            result = (result << 1) | (value & 1);
+            value >>= 1;
+        }
+
+        return result;
     }
 }
