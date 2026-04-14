@@ -227,6 +227,95 @@ def resample_mono(samples: list[float], source_sample_rate: int, target_sample_r
     return resampled
 
 
+def design_biquad_highpass(sample_rate: int, cutoff_hz: float, q: float = 0.70710678) -> tuple[float, float, float, float, float] | None:
+    nyquist = sample_rate * 0.5
+    if sample_rate <= 0 or cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
+        return None
+
+    omega = 2.0 * math.pi * cutoff_hz / sample_rate
+    sin_omega = math.sin(omega)
+    cos_omega = math.cos(omega)
+    alpha = sin_omega / (2.0 * q)
+
+    b0 = (1.0 + cos_omega) * 0.5
+    b1 = -(1.0 + cos_omega)
+    b2 = (1.0 + cos_omega) * 0.5
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_omega
+    a2 = 1.0 - alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def design_biquad_lowpass(sample_rate: int, cutoff_hz: float, q: float = 0.70710678) -> tuple[float, float, float, float, float] | None:
+    nyquist = sample_rate * 0.5
+    if sample_rate <= 0 or cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
+        return None
+
+    omega = 2.0 * math.pi * cutoff_hz / sample_rate
+    sin_omega = math.sin(omega)
+    cos_omega = math.cos(omega)
+    alpha = sin_omega / (2.0 * q)
+
+    b0 = (1.0 - cos_omega) * 0.5
+    b1 = 1.0 - cos_omega
+    b2 = (1.0 - cos_omega) * 0.5
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_omega
+    a2 = 1.0 - alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def apply_biquad(samples: list[float], coefficients: tuple[float, float, float, float, float] | None) -> list[float]:
+    if not samples or coefficients is None:
+        return samples.copy()
+
+    b0, b1, b2, a1, a2 = coefficients
+    x1 = 0.0
+    x2 = 0.0
+    y1 = 0.0
+    y2 = 0.0
+    output: list[float] = []
+    append_output = output.append
+
+    for sample in samples:
+        y0 = (b0 * sample) + (b1 * x1) + (b2 * x2) - (a1 * y1) - (a2 * y2)
+        append_output(y0)
+        x2 = x1
+        x1 = sample
+        y2 = y1
+        y1 = y0
+
+    return output
+
+
+def apply_zero_phase_biquad(samples: list[float], coefficients: tuple[float, float, float, float, float] | None) -> list[float]:
+    if not samples or coefficients is None:
+        return samples.copy()
+    forward = apply_biquad(samples, coefficients)
+    reverse = apply_biquad(list(reversed(forward)), coefficients)
+    reverse.reverse()
+    return reverse
+
+
+def bandlimit_difference_waveform(samples: list[float], sample_rate: int, low_cut_hz: float = 500.0, high_cut_hz: float = 18000.0) -> list[float]:
+    if not samples or sample_rate <= 0:
+        return samples.copy()
+
+    nyquist = sample_rate * 0.5
+    safe_low_cut = clamp(low_cut_hz, 0.0, max(0.0, nyquist * 0.9))
+    safe_high_cut = clamp(high_cut_hz, 0.0, max(0.0, nyquist * 0.95))
+
+    if safe_high_cut > 0.0 and safe_low_cut >= safe_high_cut:
+        safe_low_cut = safe_high_cut * 0.5
+
+    filtered = samples.copy()
+    if safe_low_cut >= 1.0:
+        filtered = apply_zero_phase_biquad(filtered, design_biquad_highpass(sample_rate, safe_low_cut))
+    if safe_high_cut >= 1.0 and safe_high_cut < nyquist:
+        filtered = apply_zero_phase_biquad(filtered, design_biquad_lowpass(sample_rate, safe_high_cut))
+    return filtered
+
+
 def compute_entropy_series(
     samples: list[float],
     sample_rate: int,
@@ -611,6 +700,71 @@ def draw_combined_series(
             canvas.create_text(playhead_x + 6, top + 10, text=f"{clamped:0.3f}s", anchor="nw", fill="#f8fafc", font=("Consolas", 8))
 
 
+def draw_waveform_panel(
+    canvas: tk.Canvas,
+    title: str,
+    samples: list[float],
+    sample_rate: int,
+    color: str,
+    duration_seconds: float,
+    playhead_seconds: float | None,
+    view_start_seconds: float,
+    view_window_seconds: float,
+    vertical_gain: float = 1.0,
+) -> None:
+    canvas.delete("all")
+
+    width = max(200, canvas.winfo_width())
+    height = max(100, canvas.winfo_height())
+    left = 56
+    top = 10
+    right = width - 16
+    bottom = height - 18
+    center_y = (top + bottom) / 2
+
+    canvas.create_rectangle(left, top, right, bottom, outline="#334155")
+    canvas.create_text(left, 0, text=title, anchor="nw", fill="#cbd5e1", font=("Segoe UI", 9, "bold"))
+    canvas.create_line(left, center_y, right, center_y, fill="#1f2937")
+
+    if not samples or sample_rate <= 0:
+        canvas.create_text((left + right) / 2, center_y, text="No waveform data", fill="#64748b", font=("Segoe UI", 9))
+        return
+
+    total_duration = max(duration_seconds, len(samples) / max(sample_rate, 1), 1e-6)
+    window_seconds = clamp(view_window_seconds, 0.25, total_duration)
+    max_view_start = max(0.0, total_duration - window_seconds)
+    view_start = clamp(view_start_seconds, 0.0, max_view_start)
+    view_end = min(total_duration, view_start + window_seconds)
+
+    visible_sample_start = clamp(int(view_start * sample_rate), 0, len(samples) - 1)
+    visible_sample_end = clamp(int(math.ceil(view_end * sample_rate)), visible_sample_start + 1, len(samples))
+    panel_width = max(1, right - left)
+    visible_sample_count = max(1, visible_sample_end - visible_sample_start)
+    samples_per_pixel = max(1, int(math.ceil(visible_sample_count / panel_width)))
+
+    for pixel_index in range(panel_width):
+        bucket_start = visible_sample_start + (pixel_index * samples_per_pixel)
+        if bucket_start >= visible_sample_end:
+            break
+        bucket_end = min(visible_sample_end, bucket_start + samples_per_pixel)
+        bucket = samples[bucket_start:bucket_end]
+        if not bucket:
+            continue
+
+        min_value = min(bucket)
+        max_value = max(bucket)
+        scaled_max = clamp(max_value * vertical_gain, -1.0, 1.0)
+        scaled_min = clamp(min_value * vertical_gain, -1.0, 1.0)
+        y1 = center_y - (scaled_max * ((bottom - top) * 0.46))
+        y2 = center_y - (scaled_min * ((bottom - top) * 0.46))
+        x = left + pixel_index
+        canvas.create_line(x, y1, x, y2, fill=color)
+
+    if playhead_seconds is not None and view_start <= playhead_seconds <= view_end:
+        playhead_x = left + (((playhead_seconds - view_start) / max(window_seconds, 1e-9)) * (right - left))
+        canvas.create_line(playhead_x, top, playhead_x, bottom, fill="#f8fafc", width=2)
+
+
 class PlannerVisualizerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -651,6 +805,10 @@ class PlannerVisualizerApp:
         self.run_entropy_series = PlotSeries([], "Run Entropy", blend_hex("#38bdf8", GRAPH_BACKGROUND, 0.5), "entropy", 0.0, 1.0, "exp", 0.18, 0.72)
         self.block_series = PlotSeries([], "Block Size", blend_hex("#f97316", GRAPH_BACKGROUND, 0.5), "block-size", math.log2(MIN_BLOCK_SIZE), math.log2(MAX_BLOCK_SIZE), "linear", 0.06, 0.96, "step")
         self.duration_seconds = 1.0
+        self.difference_waveform_samples: list[float] = []
+        self.original_waveform_samples: list[float] = []
+        self.run_waveform_samples: list[float] = []
+        self.waveform_sample_rate = 0
 
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -700,11 +858,23 @@ class PlannerVisualizerApp:
 
         ttk.Label(self.root, textvariable=self.status_text, padding=(16, 0, 16, 8)).pack(anchor="w")
 
-        self.graph_canvas = tk.Canvas(self.root, bg="#020617", highlightthickness=0, height=620)
-        self.graph_canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.graph_canvas = tk.Canvas(self.root, bg="#020617", highlightthickness=0, height=500)
+        self.graph_canvas.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self.graph_canvas.bind("<Configure>", lambda _event: self.redraw())
         self.graph_canvas.bind("<Button-1>", self.on_graph_click)
         self.graph_canvas.bind("<MouseWheel>", self.on_graph_wheel)
+
+        waveform_frame = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        waveform_frame.pack(fill="x")
+        self.difference_waveform_canvas = tk.Canvas(waveform_frame, bg="#020617", highlightthickness=0, height=95)
+        self.difference_waveform_canvas.pack(fill="x", pady=(0, 6))
+        self.difference_waveform_canvas.bind("<Configure>", lambda _event: self.redraw())
+        self.original_waveform_canvas = tk.Canvas(waveform_frame, bg="#020617", highlightthickness=0, height=95)
+        self.original_waveform_canvas.pack(fill="x", pady=(0, 6))
+        self.original_waveform_canvas.bind("<Configure>", lambda _event: self.redraw())
+        self.run_waveform_canvas = tk.Canvas(waveform_frame, bg="#020617", highlightthickness=0, height=95)
+        self.run_waveform_canvas.pack(fill="x")
+        self.run_waveform_canvas.bind("<Configure>", lambda _event: self.redraw())
 
         metrics_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         metrics_frame.pack(fill="x")
@@ -862,6 +1032,12 @@ class PlannerVisualizerApp:
                     ])
                     report_progress("Computing comparison metrics...")
                     metrics = compute_comparison_metrics(analysis_original_samples, run_samples, run_sample_rate)
+                    raw_difference_samples = [
+                        analysis_original_samples[index] - run_samples[index]
+                        for index in range(min(len(analysis_original_samples), len(run_samples)))
+                    ]
+                    report_progress("Band-limiting difference waveform (500 Hz - 18 kHz)...")
+                    difference_samples = bandlimit_difference_waveform(raw_difference_samples, run_sample_rate)
                     summary_metrics = parse_summary_metrics(run_folder)
                     if summary_metrics.avg_audio_kbps is not None:
                         metrics.avg_audio_kbps = summary_metrics.avg_audio_kbps
@@ -882,6 +1058,10 @@ class PlannerVisualizerApp:
                         self.original_entropy_series = PlotSeries(original_entropy, "Original Entropy", blend_hex("#22c55e", GRAPH_BACKGROUND, 0.5), "entropy", 0.0, 1.0, "exp", 0.18, 0.72)
                         self.run_entropy_series = PlotSeries(run_entropy, "Run Entropy", blend_hex("#38bdf8", GRAPH_BACKGROUND, 0.5), "entropy", 0.0, 1.0, "exp", 0.18, 0.72)
                         self.block_series = PlotSeries(block_activity, "Block Size", blend_hex("#f97316", GRAPH_BACKGROUND, 0.5), "block-size", math.log2(MIN_BLOCK_SIZE), math.log2(MAX_BLOCK_SIZE), "linear", 0.06, 0.96, "step")
+                        self.difference_waveform_samples = difference_samples
+                        self.original_waveform_samples = analysis_original_samples
+                        self.run_waveform_samples = run_samples
+                        self.waveform_sample_rate = run_sample_rate
                         self.metrics = metrics
                         self.metric_duration.set(f"{duration_seconds:0.2f}s")
                         self.metric_snr.set(f"{metrics.snr_db:0.2f} dB" if metrics.snr_db is not None else "-")
@@ -938,6 +1118,40 @@ class PlannerVisualizerApp:
         draw_combined_series(
             self.graph_canvas,
             series_list,
+            self.duration_seconds,
+            self._playhead_seconds,
+            self.view_start_seconds.get(),
+            self.view_window_seconds.get(),
+        )
+        draw_waveform_panel(
+            self.difference_waveform_canvas,
+            "Difference Waveform",
+            self.difference_waveform_samples,
+            self.waveform_sample_rate,
+            blend_hex("#f43f5e", GRAPH_BACKGROUND, 0.85),
+            self.duration_seconds,
+            self._playhead_seconds,
+            self.view_start_seconds.get(),
+            self.view_window_seconds.get(),
+            6.0,
+        )
+        draw_waveform_panel(
+            self.original_waveform_canvas,
+            "Original Waveform",
+            self.original_waveform_samples,
+            self.waveform_sample_rate,
+            blend_hex("#22c55e", GRAPH_BACKGROUND, 0.7),
+            self.duration_seconds,
+            self._playhead_seconds,
+            self.view_start_seconds.get(),
+            self.view_window_seconds.get(),
+        )
+        draw_waveform_panel(
+            self.run_waveform_canvas,
+            "Run Waveform",
+            self.run_waveform_samples,
+            self.waveform_sample_rate,
+            blend_hex("#38bdf8", GRAPH_BACKGROUND, 0.7),
             self.duration_seconds,
             self._playhead_seconds,
             self.view_start_seconds.get(),

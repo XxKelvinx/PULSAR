@@ -174,6 +174,11 @@ public sealed class PulsarPlannerSettings
     public double LargeBlock4096PromotionThreshold { get; init; } = 3.75;
     public double LargeBlock8192PromotionThreshold { get; init; } = 4.55;
     public double LargeBlock16384PromotionThreshold { get; init; } = 5.40;
+    public int Min4096BlockRun { get; init; } = 2;
+    public int Min8192BlockRun { get; init; } = 2;
+    public int Min16384BlockRun { get; init; } = 2;
+    public double LargeBlockEntryPenalty { get; init; } = 0.18;
+    public double LargeBlockExtensionBonus { get; init; } = 0.08;
 }
 
 internal readonly record struct SegmentAnalysisData(
@@ -200,6 +205,11 @@ internal sealed class PulsarContextPattern
     public required int[] SegmentStates { get; init; }
     public required int[] BlockStates { get; init; }
 }
+
+internal readonly record struct LargeBlockRunDecision(
+    int State,
+    int ContextCount,
+    double Gain);
 
 public sealed class PulsarPlanner
 {
@@ -269,15 +279,15 @@ public sealed class PulsarPlanner
     private const double LateBurstFluxTrigger = 0.14;
     private const double LateBurstPreEchoTrigger = 0.30;
 
-    private const double RecoveryStopTransientNeed = 0.42;
-    private const double RecoveryBass2048Threshold = 0.58;
-    private const double RecoveryBass4096Threshold = 0.82;
+    private const double RecoveryStopTransientNeed = 0.34;
+    private const double RecoveryBass2048Threshold = 0.64;
+    private const double RecoveryBass4096Threshold = 0.88;
 
-    private const double GapRecoveryTransientCeiling = 0.26;
-    private const double GapRecoveryFluxCeiling = 0.18;
-    private const double GapRecoveryPreEchoCeiling = 0.22;
-    private const double GapRecovery2048BassThreshold = 0.52;
-    private const double GapRecovery4096BassThreshold = 0.78;
+    private const double GapRecoveryTransientCeiling = 0.20;
+    private const double GapRecoveryFluxCeiling = 0.14;
+    private const double GapRecoveryPreEchoCeiling = 0.16;
+    private const double GapRecovery2048BassThreshold = 0.60;
+    private const double GapRecovery4096BassThreshold = 0.86;
 
     private const double ClampTransientFloor = 0.30;
     private const double Clamp2048BassThreshold = 0.82;
@@ -1391,6 +1401,8 @@ public sealed class PulsarPlanner
         EnforceAdjacentSteps(stateSequence, DefaultStateIndex);
         SuppressIsolatedBlips(stateSequence, analyses);
         PromoteLargeBlockRuns(analyses, stateSequence);
+        EnforceAdjacentSteps(stateSequence, DefaultStateIndex);
+        SuppressIsolatedBlips(stateSequence, analyses);
         return BuildPlansFromStateSequence(analyses, stateSequence);
     }
 
@@ -1686,6 +1698,8 @@ public sealed class PulsarPlanner
         var contextDesired = new double[contextCount];
         var contextUrgency = new double[contextCount];
         var contextBassTone = new double[contextCount];
+        var contextTransientNeed = new double[contextCount];
+        var contextTransientRelief = new double[contextCount];
 
         for (int contextIndex = 0; contextIndex < contextCount; contextIndex++)
         {
@@ -1711,68 +1725,132 @@ public sealed class PulsarPlanner
             contextUrgency[contextIndex] = ComputeBlockUrgency(analyses, startSegment, ContextSegmentCount);
 
             double bassToneTotal = 0.0;
+            double reliefTotal = 0.0;
+            double transientNeedMax = 0.0;
             for (int i = 0; i < ContextSegmentCount; i++)
             {
-                var spectral = analyses[startSegment + i].Spectral;
+                var analysis = analyses[startSegment + i];
+                var spectral = analysis.Spectral;
                 bassToneTotal += spectral.SubBass + spectral.Bass + (0.6 * spectral.LowMid) + ((1.0 - spectral.Flatness) * 0.35);
+                reliefTotal += ComputeLargeBlockTransientRelief(analysis);
+                transientNeedMax = Math.Max(transientNeedMax, ComputePerAnalysisTransientNeed(analysis));
             }
 
             contextBassTone[contextIndex] = bassToneTotal / ContextSegmentCount;
+            contextTransientNeed[contextIndex] = transientNeedMax;
+            contextTransientRelief[contextIndex] = reliefTotal / ContextSegmentCount;
         }
 
-        foreach (int state in LargeBlockPromotionStates)
+        var contiguousPromotableContexts = new int[contextCount];
+        for (int contextIndex = contextCount - 1; contextIndex >= 0; contextIndex--)
         {
-            int contextsPerBlock = BlockSteps[state] / PulsarBlockLadder.DefaultBlockSize;
-            if (contextsPerBlock <= 1 || contextsPerBlock > contextCount)
+            if (!promotableContexts[contextIndex])
+            {
+                contiguousPromotableContexts[contextIndex] = 0;
+                continue;
+            }
+
+            contiguousPromotableContexts[contextIndex] = 1;
+            if (contextIndex + 1 < contextCount)
+            {
+                contiguousPromotableContexts[contextIndex] += contiguousPromotableContexts[contextIndex + 1];
+            }
+        }
+
+        var bestGain = new double[contextCount + 1];
+        var bestDecision = new LargeBlockRunDecision[contextCount];
+
+        for (int contextStart = contextCount - 1; contextStart >= 0; contextStart--)
+        {
+            bestGain[contextStart] = bestGain[contextStart + 1];
+
+            int availableContexts = contiguousPromotableContexts[contextStart];
+            if (availableContexts == 0)
             {
                 continue;
             }
 
-            for (int contextStart = 0; contextStart <= contextCount - contextsPerBlock; contextStart += contextsPerBlock)
+            foreach (int state in LargeBlockPromotionStates)
             {
-                bool eligible = true;
-                double desiredTotal = 0.0;
-                double maxUrgency = 0.0;
-                double bassToneTotal = 0.0;
-
-                for (int contextOffset = 0; contextOffset < contextsPerBlock; contextOffset++)
+                int contextsPerBlock = BlockSteps[state] / PulsarBlockLadder.DefaultBlockSize;
+                int minRunBlocks = GetMinimumLargeBlockRunBlocks(state);
+                int minRunContexts = contextsPerBlock * minRunBlocks;
+                int maxRunContexts = GetMaximumPromotableRunContexts(state, availableContexts);
+                if (contextsPerBlock <= 1 || maxRunContexts < minRunContexts)
                 {
-                    int contextIndex = contextStart + contextOffset;
-                    if (!promotableContexts[contextIndex])
+                    continue;
+                }
+
+                double desiredTotal = 0.0;
+                double bassToneTotal = 0.0;
+                double reliefTotal = 0.0;
+                double maxUrgency = 0.0;
+                double maxTransientNeed = 0.0;
+
+                for (int runContexts = 1; runContexts <= maxRunContexts; runContexts++)
+                {
+                    int contextIndex = contextStart + runContexts - 1;
+                    desiredTotal += contextDesired[contextIndex];
+                    bassToneTotal += contextBassTone[contextIndex];
+                    reliefTotal += contextTransientRelief[contextIndex];
+                    maxUrgency = Math.Max(maxUrgency, contextUrgency[contextIndex]);
+                    maxTransientNeed = Math.Max(maxTransientNeed, contextTransientNeed[contextIndex]);
+
+                    if (runContexts < minRunContexts || runContexts % contextsPerBlock != 0)
                     {
-                        eligible = false;
-                        break;
+                        continue;
                     }
 
-                    desiredTotal += contextDesired[contextIndex];
-                    maxUrgency = Math.Max(maxUrgency, contextUrgency[contextIndex]);
-                    bassToneTotal += contextBassTone[contextIndex];
-                }
+                    int runBlocks = runContexts / contextsPerBlock;
+                    double averageDesired = desiredTotal / runContexts;
+                    double averageBassTone = bassToneTotal / runContexts;
+                    double averageRelief = reliefTotal / runContexts;
 
-                if (!eligible)
-                {
-                    continue;
-                }
+                    if (!ShouldPromoteLargeBlock(state, averageDesired, maxUrgency, averageBassTone, maxTransientNeed, runBlocks))
+                    {
+                        continue;
+                    }
 
-                double averageDesired = desiredTotal / contextsPerBlock;
-                double averageBassTone = bassToneTotal / contextsPerBlock;
-                if (!ShouldPromoteLargeBlock(state, averageDesired, maxUrgency, averageBassTone))
-                {
-                    continue;
-                }
+                    double runGain = ComputeLargeBlockRunGain(
+                        state,
+                        averageDesired,
+                        maxUrgency,
+                        averageBassTone,
+                        averageRelief,
+                        maxTransientNeed,
+                        runBlocks);
+                    if (double.IsNegativeInfinity(runGain))
+                    {
+                        continue;
+                    }
 
-                int segmentStart = contextStart * ContextSegmentCount;
-                int segmentLength = contextsPerBlock * ContextSegmentCount;
-                for (int i = 0; i < segmentLength; i++)
-                {
-                    stateSequence[segmentStart + i] = state;
-                }
-
-                for (int contextOffset = 0; contextOffset < contextsPerBlock; contextOffset++)
-                {
-                    promotableContexts[contextStart + contextOffset] = false;
+                    double totalGain = runGain + bestGain[contextStart + runContexts];
+                    if (totalGain > bestGain[contextStart] + 1e-9)
+                    {
+                        bestGain[contextStart] = totalGain;
+                        bestDecision[contextStart] = new LargeBlockRunDecision(state, runContexts, runGain);
+                    }
                 }
             }
+        }
+
+        for (int contextStart = 0; contextStart < contextCount;)
+        {
+            LargeBlockRunDecision decision = bestDecision[contextStart];
+            if (decision.ContextCount <= 0 || decision.Gain <= 0.0 || bestGain[contextStart] <= bestGain[contextStart + 1] + 1e-9)
+            {
+                contextStart++;
+                continue;
+            }
+
+            int segmentStart = contextStart * ContextSegmentCount;
+            int segmentLength = decision.ContextCount * ContextSegmentCount;
+            for (int i = 0; i < segmentLength; i++)
+            {
+                stateSequence[segmentStart + i] = decision.State;
+            }
+
+            contextStart += decision.ContextCount;
         }
     }
 
@@ -1780,21 +1858,115 @@ public sealed class PulsarPlanner
         int state,
         double averageDesired,
         double maxUrgency,
-        double averageBassTone)
+        double averageBassTone,
+        double maxTransientNeed,
+        int runBlocks)
     {
+        if (runBlocks < GetMinimumLargeBlockRunBlocks(state))
+        {
+            return false;
+        }
+
         return state switch
         {
             4 => averageDesired >= _settings.LargeBlock4096PromotionThreshold
-                && maxUrgency <= 0.24
+                && maxUrgency <= 0.22
+                && maxTransientNeed <= 0.20
                 && averageBassTone >= 0.30,
             5 => averageDesired >= _settings.LargeBlock8192PromotionThreshold
-                && maxUrgency <= 0.16
+                && maxUrgency <= 0.14
+                && maxTransientNeed <= 0.12
                 && averageBassTone >= 0.34,
             6 => averageDesired >= _settings.LargeBlock16384PromotionThreshold
-                && maxUrgency <= 0.11
+                && maxUrgency <= 0.10
+                && maxTransientNeed <= 0.08
                 && averageBassTone >= 0.38,
             _ => false,
         };
+    }
+
+    private int GetMinimumLargeBlockRunBlocks(int state)
+    {
+        return state switch
+        {
+            4 => _settings.Min4096BlockRun,
+            5 => _settings.Min8192BlockRun,
+            6 => _settings.Min16384BlockRun,
+            _ => 1,
+        };
+    }
+
+    private static int GetMaximumPromotableRunContexts(int state, int availableContexts)
+    {
+        int contextsPerBlock = BlockSteps[state] / PulsarBlockLadder.DefaultBlockSize;
+        return availableContexts - (availableContexts % contextsPerBlock);
+    }
+
+    private double ComputeLargeBlockRunGain(
+        int state,
+        double averageDesired,
+        double maxUrgency,
+        double averageBassTone,
+        double averageRelief,
+        double maxTransientNeed,
+        int runBlocks)
+    {
+        double desiredThreshold;
+        double urgencyCeiling;
+        double transientCeiling;
+        double bassThreshold;
+        double reliefThreshold;
+        double stateBias;
+
+        switch (state)
+        {
+            case 4:
+                desiredThreshold = _settings.LargeBlock4096PromotionThreshold;
+                urgencyCeiling = 0.22;
+                transientCeiling = 0.20;
+                bassThreshold = 0.30;
+                reliefThreshold = 0.34;
+                stateBias = 0.08;
+                break;
+            case 5:
+                desiredThreshold = _settings.LargeBlock8192PromotionThreshold;
+                urgencyCeiling = 0.14;
+                transientCeiling = 0.12;
+                bassThreshold = 0.34;
+                reliefThreshold = 0.40;
+                stateBias = 0.14;
+                break;
+            case 6:
+                desiredThreshold = _settings.LargeBlock16384PromotionThreshold;
+                urgencyCeiling = 0.10;
+                transientCeiling = 0.08;
+                bassThreshold = 0.38;
+                reliefThreshold = 0.46;
+                stateBias = 0.20;
+                break;
+            default:
+                return double.NegativeInfinity;
+        }
+
+        double desiredMargin = averageDesired - desiredThreshold;
+        double urgencyMargin = urgencyCeiling - maxUrgency;
+        double transientMargin = transientCeiling - maxTransientNeed;
+        double bassMargin = averageBassTone - bassThreshold;
+        double reliefMargin = Math.Max(averageRelief - reliefThreshold, 0.0);
+        if (desiredMargin < 0.0 || urgencyMargin < 0.0 || transientMargin < 0.0 || bassMargin < 0.0)
+        {
+            return double.NegativeInfinity;
+        }
+
+        double extensionBonus = Math.Max(runBlocks - GetMinimumLargeBlockRunBlocks(state), 0) * _settings.LargeBlockExtensionBonus;
+        return (1.65 * desiredMargin)
+            + (1.10 * urgencyMargin)
+            + (1.05 * transientMargin)
+            + (0.85 * bassMargin)
+            + (0.55 * reliefMargin)
+            + stateBias
+            + extensionBonus
+            - _settings.LargeBlockEntryPenalty;
     }
 
     private List<PulsarFramePlan> BuildPlansFromStateSequence(
@@ -2404,8 +2576,9 @@ public sealed class PulsarPlanner
 
                 targetState = Math.Min(targetState, ahead switch
                 {
-                    1 => 2,
-                    2 => 3,
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
                     _ => 4,
                 });
 
@@ -2450,9 +2623,9 @@ public sealed class PulsarPlanner
 
             int targetState = bassNeedMax switch
             {
-                >= GapRecovery4096BassThreshold => 4,
+                >= GapRecovery4096BassThreshold => 3,
                 >= GapRecovery2048BassThreshold => 3,
-                _ => 3,
+                _ => 2,
             };
 
             for (int j = 0; j < 3 && i + j < states.Length; j++)

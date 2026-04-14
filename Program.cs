@@ -171,6 +171,8 @@ var samples = sampleRate == inputSampleRate
     : ResampleInterleaved(inputAudio.Samples, channels, inputSampleRate, sampleRate);
 float[] processed;
 double? engineProcessingSeconds = null;
+double? plannerProcessingSeconds = null;
+double? totalProcessingSeconds = null;
 
 // --- FULL ARCHIVE ENCODE/DECODE MODE ---
 if (useVbrPlsrMode)
@@ -204,10 +206,11 @@ if (useLegacyPlanMode)
     Console.WriteLine($"Running Pure MDCT Legacy Mode with frame planning...");
     planners = new PulsarPlanner[channels];
     for (int channel = 0; channel < channels; channel++) planners[channel] = new PulsarPlanner();
-    var engineStopwatch = Stopwatch.StartNew();
-    processed = ProcessLegacyPlanner(samples, channels, planners);
-    engineStopwatch.Stop();
-    engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
+    var timedResult = ProcessLegacyPlanner(samples, channels, planners);
+    processed = timedResult.Output;
+    plannerProcessingSeconds = timedResult.PlannerSeconds;
+    engineProcessingSeconds = timedResult.RenderSeconds;
+    totalProcessingSeconds = timedResult.TotalSeconds;
 }
 else if (useLegacyMode)
 {
@@ -216,6 +219,7 @@ else if (useLegacyMode)
     processed = ProcessLegacy(samples, channels, legacyBlockSize);
     engineStopwatch.Stop();
     engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
+    totalProcessingSeconds = engineProcessingSeconds;
 }
 else
 {
@@ -224,6 +228,7 @@ else
     processed = PulsarSuperframeArchiveCodec.RenderSpectralPcm(samples, sampleRate, channels, targetKbps, effectiveVbrQuality).Samples;
     engineStopwatch.Stop();
     engineProcessingSeconds = engineStopwatch.Elapsed.TotalSeconds;
+    totalProcessingSeconds = engineProcessingSeconds;
 }
 
 var outputFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels);
@@ -232,7 +237,13 @@ using (var writer = new WaveFileWriter(outputPath, outputFormat))
     writer.WriteSamples(processed, 0, processed.Length);
 }
 
-WriteResidualComparison(inputPath, outputPath, useLegacyMode ? "legacy" : "bypass", engineProcessingSeconds);
+WriteResidualComparison(
+    inputPath,
+    outputPath,
+    useLegacyPlanMode ? "legacyplan" : useLegacyMode ? "legacy" : "bypass",
+    engineProcessingSeconds,
+    plannerProcessingSeconds,
+    totalProcessingSeconds);
 
 if (planners is not null)
 {
@@ -491,7 +502,7 @@ static float[] ProcessLegacy(float[] interleavedSamples, int channels, int block
     return output;
 }
 
-static float[] ProcessLegacyPlanner(float[] interleavedSamples, int channels, PulsarPlanner[] planners)
+static (float[] Output, double PlannerSeconds, double RenderSeconds, double TotalSeconds) ProcessLegacyPlanner(float[] interleavedSamples, int channels, PulsarPlanner[] planners)
 {
     var channelBuffers = new float[channels][];
     int frames = interleavedSamples.Length / channels;
@@ -502,9 +513,14 @@ static float[] ProcessLegacyPlanner(float[] interleavedSamples, int channels, Pu
             channelBuffers[channel][frame] = interleavedSamples[frame * channels + channel];
 
     var processedChannels = new float[channels][];
+    double plannerSeconds = 0.0;
+    double renderSeconds = 0.0;
     for (int channel = 0; channel < channels; channel++)
     {
-        processedChannels[channel] = PulsarTransformEngine.ProcessLegacyPlanner(channelBuffers[channel], planners[channel]);
+        var timedResult = PulsarTransformEngine.ProcessLegacyPlannerWithTimings(channelBuffers[channel], planners[channel]);
+        processedChannels[channel] = timedResult.Output;
+        plannerSeconds += timedResult.PlannerSeconds;
+        renderSeconds += timedResult.RenderSeconds;
     }
 
     var output = new float[interleavedSamples.Length];
@@ -513,7 +529,7 @@ static float[] ProcessLegacyPlanner(float[] interleavedSamples, int channels, Pu
         float[] processedChannel = processedChannels[channel];
         for (int frame = 0; frame < frames; frame++) output[frame * channels + channel] = processedChannel[frame];
     }
-    return output;
+    return (output, plannerSeconds, renderSeconds, plannerSeconds + renderSeconds);
 }
 
 static PulsarPlanner[] BuildArchiveStylePlanners(float[] interleavedSamples, int channels, int targetKbps)
@@ -709,7 +725,13 @@ static void PrintUsage()
 
 static int QualityToNominalKbps(int quality) => new int[] { 320, 288, 256, 224, 192, 160, 128, 112, 96, 80 }[Math.Clamp(quality, 0, 9)];
 
-static void WriteResidualComparison(string originalPath, string processedPath, string mode, double? engineProcessingSeconds = null)
+static void WriteResidualComparison(
+    string originalPath,
+    string processedPath,
+    string mode,
+    double? engineProcessingSeconds = null,
+    double? plannerProcessingSeconds = null,
+    double? totalProcessingSeconds = null)
 {
     if (!File.Exists(originalPath) || !File.Exists(processedPath)) return;
     var originalReader = ReadAudioFile(originalPath);
@@ -746,10 +768,20 @@ static void WriteResidualComparison(string originalPath, string processedPath, s
         summary.WriteLine($"Mode: {mode}");
         summary.WriteLine($"Input file: {Path.GetFileName(originalPath)}");
         summary.WriteLine($"Output file: {Path.GetFileName(processedPath)}");
+        if (plannerProcessingSeconds.HasValue)
+        {
+            summary.WriteLine($"Planner processing seconds: {FormatDouble(plannerProcessingSeconds.Value)}");
+            summary.WriteLine($"Planner processing ms: {FormatDouble(plannerProcessingSeconds.Value * 1000.0)}");
+        }
         if (engineProcessingSeconds.HasValue)
         {
             summary.WriteLine($"Engine processing seconds: {FormatDouble(engineProcessingSeconds.Value)}");
             summary.WriteLine($"Engine processing ms: {FormatDouble(engineProcessingSeconds.Value * 1000.0)}");
+        }
+        if (totalProcessingSeconds.HasValue)
+        {
+            summary.WriteLine($"Total processing seconds: {FormatDouble(totalProcessingSeconds.Value)}");
+            summary.WriteLine($"Total processing ms: {FormatDouble(totalProcessingSeconds.Value * 1000.0)}");
         }
         summary.WriteLine($"Duration seconds: {FormatDouble(seconds)}");
         summary.WriteLine($"Decoded WAV kbits: {FormatDouble(decodedKbits)}");

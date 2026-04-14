@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Numerics;
@@ -13,8 +14,8 @@ public static class PulsarTransformEngine
     {
         public required int Size { get; init; }
         public required int[] BitReverse { get; init; }
-        public required double[] StageMulReal { get; init; }
-        public required double[] StageMulImag { get; init; }
+        public required double[] TwiddleReal { get; init; }
+        public required double[] TwiddleImag { get; init; }
     }
 
     private sealed class Dct4Plan
@@ -105,6 +106,22 @@ public static class PulsarTransformEngine
 
         var framePlans = planner.PlanLegacyRenderSong(input, null);
         return RenderExplicitPlannerPath(input, framePlans);
+    }
+
+    public static (float[] Output, double PlannerSeconds, double RenderSeconds) ProcessLegacyPlannerWithTimings(float[] input, PulsarPlanner planner)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(planner);
+
+        var plannerStopwatch = Stopwatch.StartNew();
+        var framePlans = planner.PlanLegacyRenderSong(input, null);
+        plannerStopwatch.Stop();
+
+        var renderStopwatch = Stopwatch.StartNew();
+        float[] output = RenderExplicitPlannerPath(input, framePlans);
+        renderStopwatch.Stop();
+
+        return (output, plannerStopwatch.Elapsed.TotalSeconds, renderStopwatch.Elapsed.TotalSeconds);
     }
 
     public static float[] ProcessWithBitAllocation(
@@ -458,6 +475,15 @@ public static class PulsarTransformEngine
             }
         }
 
+        int segmentCount = endSegment - startSegment + 1;
+        if (segmentCount > 1)
+        {
+            for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
+            {
+                averagedBandBits[bandIndex] /= segmentCount;
+            }
+        }
+
         return (averagedBandBits, psychoFrames[centerSegment]);
     }
 
@@ -735,29 +761,34 @@ public static class PulsarTransformEngine
         int flatEnd,
         int overlapCount)
     {
-        for (int i = 0; i < blockSize; i++)
+        int overlapEnd = Math.Min(leftOverlap, overlapCount);
+        int i = 0;
+
+        if (Vector.IsHardwareAccelerated)
         {
-            int outIndex = outputOffset + i;
-            if (i < leftOverlap)
+            int vSize = Vector<float>.Count;
+            for (; i <= overlapEnd - vSize; i += vSize)
             {
-                output[outIndex] = block[i] + ((i < overlapCount) ? overlapBuffer[i] : 0f);
-            }
-            else if (i < flatEnd)
-            {
-                output[outIndex] = block[i];
-            }
-            else
-            {
-                overlapBuffer[i - flatEnd] = block[i];
+                var b = new Vector<float>(block, i);
+                var o = new Vector<float>(overlapBuffer, i);
+                (b + o).CopyTo(output, outputOffset + i);
             }
         }
-    }
-
-    private static void AccumulateBlock(float[] block, int blockSize, float[] output, int outputOffset)
-    {
-        for (int i = 0; i < blockSize; i++)
+        for (; i < overlapEnd; i++)
         {
-            output[outputOffset + i] += block[i];
+            output[outputOffset + i] = block[i] + overlapBuffer[i];
+        }
+
+        int copyLen = flatEnd - overlapEnd;
+        if (copyLen > 0)
+        {
+            Buffer.BlockCopy(block, overlapEnd * sizeof(float), output, (outputOffset + overlapEnd) * sizeof(float), copyLen * sizeof(float));
+        }
+
+        int tailLen = blockSize - flatEnd;
+        if (tailLen > 0)
+        {
+            Buffer.BlockCopy(block, flatEnd * sizeof(float), overlapBuffer, 0, tailLen * sizeof(float));
         }
     }
 
@@ -774,45 +805,74 @@ public static class PulsarTransformEngine
     {
         int halfSize = transformSize;
         int quarterSize = halfSize / 2;
-        int outputIndex = 0;
+        int oi = 0;
 
-        void WriteSample(float sample)
+        for (int i = 0; i < quarterSize; i++, oi++)
         {
-            int outIndex = outputOffset + outputIndex;
-            if (outputIndex < leftOverlap)
+            float sample = folded[quarterSize + i] * window[oi];
+            if (oi < leftOverlap)
             {
-                output[outIndex] = sample + ((outputIndex < overlapCount) ? overlapBuffer[outputIndex] : 0f);
+                output[outputOffset + oi] = sample + ((oi < overlapCount) ? overlapBuffer[oi] : 0f);
             }
-            else if (outputIndex < flatEnd)
+            else if (oi < flatEnd)
             {
-                output[outIndex] = sample;
+                output[outputOffset + oi] = sample;
             }
             else
             {
-                overlapBuffer[outputIndex - flatEnd] = sample;
+                overlapBuffer[oi - flatEnd] = sample;
             }
-
-            outputIndex++;
         }
 
-        for (int i = 0; i < quarterSize; i++)
+        for (int i = 0; i < quarterSize; i++, oi++)
         {
-            WriteSample(folded[quarterSize + i] * window[outputIndex]);
+            float sample = -folded[halfSize - 1 - i] * window[oi];
+            if (oi < leftOverlap)
+            {
+                output[outputOffset + oi] = sample + ((oi < overlapCount) ? overlapBuffer[oi] : 0f);
+            }
+            else if (oi < flatEnd)
+            {
+                output[outputOffset + oi] = sample;
+            }
+            else
+            {
+                overlapBuffer[oi - flatEnd] = sample;
+            }
         }
 
-        for (int i = 0; i < quarterSize; i++)
+        for (int i = 0; i < quarterSize; i++, oi++)
         {
-            WriteSample(-folded[halfSize - 1 - i] * window[outputIndex]);
+            float sample = -folded[quarterSize - 1 - i] * window[oi];
+            if (oi < leftOverlap)
+            {
+                output[outputOffset + oi] = sample + ((oi < overlapCount) ? overlapBuffer[oi] : 0f);
+            }
+            else if (oi < flatEnd)
+            {
+                output[outputOffset + oi] = sample;
+            }
+            else
+            {
+                overlapBuffer[oi - flatEnd] = sample;
+            }
         }
 
-        for (int i = 0; i < quarterSize; i++)
+        for (int i = 0; i < quarterSize; i++, oi++)
         {
-            WriteSample(-folded[quarterSize - 1 - i] * window[outputIndex]);
-        }
-
-        for (int i = 0; i < quarterSize; i++)
-        {
-            WriteSample(-folded[i] * window[outputIndex]);
+            float sample = -folded[i] * window[oi];
+            if (oi < leftOverlap)
+            {
+                output[outputOffset + oi] = sample + ((oi < overlapCount) ? overlapBuffer[oi] : 0f);
+            }
+            else if (oi < flatEnd)
+            {
+                output[outputOffset + oi] = sample;
+            }
+            else
+            {
+                overlapBuffer[oi - flatEnd] = sample;
+            }
         }
     }
 
@@ -822,8 +882,12 @@ public static class PulsarTransformEngine
         double[] real = workspace.FftReal;
         double[] imag = workspace.FftImag;
 
-        Array.Clear(real, 0, plan.FftSize);
-        Array.Clear(imag, 0, plan.FftSize);
+        int tail = plan.FftSize - plan.Size;
+        if (tail > 0)
+        {
+            Array.Clear(real, plan.Size, tail);
+            Array.Clear(imag, plan.Size, tail);
+        }
 
         for (int i = 0; i < plan.Size; i++)
         {
@@ -874,22 +938,22 @@ public static class PulsarTransformEngine
                 bitReverse[i] = ReverseBits(i, levels);
             }
 
-            double[] stageMulReal = new double[levels];
-            double[] stageMulImag = new double[levels];
-            int stageIndex = 0;
-            for (int currentSize = 2; currentSize <= fftSize; currentSize <<= 1, stageIndex++)
+            int halfFft = fftSize / 2;
+            double[] twiddleReal = new double[Math.Max(1, halfFft)];
+            double[] twiddleImag = new double[Math.Max(1, halfFft)];
+            for (int k = 0; k < halfFft; k++)
             {
-                double theta = -2.0 * Math.PI / currentSize;
-                stageMulReal[stageIndex] = Math.Cos(theta);
-                stageMulImag[stageIndex] = Math.Sin(theta);
+                double theta = -2.0 * Math.PI * k / fftSize;
+                twiddleReal[k] = Math.Cos(theta);
+                twiddleImag[k] = Math.Sin(theta);
             }
 
             return new ComplexFftPlan
             {
                 Size = fftSize,
                 BitReverse = bitReverse,
-                StageMulReal = stageMulReal,
-                StageMulImag = stageMulImag,
+                TwiddleReal = twiddleReal,
+                TwiddleImag = twiddleImag,
             };
         });
     }
@@ -957,22 +1021,24 @@ public static class PulsarTransformEngine
             }
         }
 
-        int stageIndex = 0;
-        for (int size = 2; size <= plan.Size; size <<= 1, stageIndex++)
+        double[] twiddleReal = plan.TwiddleReal;
+        double[] twiddleImag = plan.TwiddleImag;
+        double imagSign = inverse ? -1.0 : 1.0;
+
+        for (int size = 2; size <= plan.Size; size <<= 1)
         {
             int halfSize = size >> 1;
-            double wMulReal = plan.StageMulReal[stageIndex];
-            double wMulImag = inverse ? -plan.StageMulImag[stageIndex] : plan.StageMulImag[stageIndex];
+            int stride = plan.Size / size;
 
             for (int start = 0; start < plan.Size; start += size)
             {
-                double wReal = 1.0;
-                double wImag = 0.0;
-
                 for (int k = 0; k < halfSize; k++)
                 {
                     int evenIndex = start + k;
                     int oddIndex = evenIndex + halfSize;
+                    int twiddleIndex = k * stride;
+                    double wReal = twiddleReal[twiddleIndex];
+                    double wImag = twiddleImag[twiddleIndex] * imagSign;
 
                     double oddReal = (real[oddIndex] * wReal) - (imag[oddIndex] * wImag);
                     double oddImag = (real[oddIndex] * wImag) + (imag[oddIndex] * wReal);
@@ -981,11 +1047,6 @@ public static class PulsarTransformEngine
                     imag[oddIndex] = imag[evenIndex] - oddImag;
                     real[evenIndex] += oddReal;
                     imag[evenIndex] += oddImag;
-
-                    double nextReal = (wReal * wMulReal) - (wImag * wMulImag);
-                    double nextImag = (wReal * wMulImag) + (wImag * wMulReal);
-                    wReal = nextReal;
-                    wImag = nextImag;
                 }
             }
         }
