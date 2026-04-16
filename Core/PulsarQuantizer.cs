@@ -133,9 +133,17 @@ public static class PulsarQuantizer
             uint stepQ = QuantizeLogValue(rawNormalizedStep, MinNormalizedStep, MaxNormalizedStep, StepQuantLevels);
             float syncedNormalizedStep = DequantizeLogValue(stepQ, MinNormalizedStep, MaxNormalizedStep, StepQuantLevels);
 
+            // Magic Rounding Offset (MRO): psychoacoustic dead-zone bias.
+            // Inspired by the FDK-AAC dZone quantizer offset (k = 0.23) and LAME magic float rounding.
+            // For masked or sub-threshold bands (SMR < 0), we bias rounding toward zero (k → 0.23).
+            // For clearly audible content (SMR > 9 dB), we use normal symmetric rounding (k = 0.50).
+            // This produces more zeros for perceptually irrelevant coefficients without any explicit
+            // zero-run coding; the entropy coder profits automatically.
+            float magicRoundOffset = ComputeMagicRoundOffset(smrDb);
+
             int[] levels = new int[width];
 
-            // 3. LEVELS BERECHNEN (Mit den synchronisierten Werten!)
+            // 3. LEVELS BERECHNEN (Mit den synchronisierten Werten und Magic Rounding Offset!)
             for (int i = start; i < end; i++)
             {
                 float value = spectrum[i];
@@ -147,7 +155,10 @@ public static class PulsarQuantizer
 
                 float normalized = value / syncedScale;
                 float shaped = MathF.Sign(normalized) * MathF.Pow(MathF.Abs(normalized), syncedGamma);
-                levels[i - start] = (int)MathF.Round(shaped / syncedNormalizedStep);
+                // Apply psychoacoustic rounding bias: floor(|x|/step + bias) * sign(x)
+                float absShapedNorm = MathF.Abs(shaped / syncedNormalizedStep);
+                int level = (int)MathF.Floor(absShapedNorm + magicRoundOffset);
+                levels[i - start] = shaped < 0.0f ? -level : level;
             }
 
             bands[bandIndex] = new PulsarQuantizedBand
@@ -189,6 +200,27 @@ public static class PulsarQuantizer
     }
 
     // --- HELPER ---
+
+    /// <summary>
+    /// Computes the psychoacoustic rounding bias for quantization (Magic Rounding Offset).
+    /// Translates the FDK-AAC dead-zone quantizer concept (k = 0.23 for masked content,
+    /// k = 0.50 for audible content) into an SMR-driven floating-point bias.
+    /// </summary>
+    /// <param name="smrDb">Signal-to-Mask Ratio of the sub-band in dB. Negative = masked.</param>
+    /// <returns>Rounding offset in [0.23, 0.50] where 0.23 means wide dead zone (more zeros).</returns>
+    private static float ComputeMagicRoundOffset(float smrDb)
+    {
+        // FDK-AAC uses 0.23 for dead-zone quant (dZoneQuantEnable=true) and ~0.4054 otherwise.
+        // We interpolate smoothly based on SMR: below -3 dB = fully masked → 0.23; above 9 dB = audible → 0.50.
+        const float kMasked = 0.23f;   // FDK-AAC dZone offset
+        const float kAudible = 0.50f;  // standard symmetric rounding
+        const float smrLow = -3.0f;
+        const float smrHigh = 9.0f;
+
+        float t = Math.Clamp((smrDb - smrLow) / (smrHigh - smrLow), 0.0f, 1.0f);
+        return kMasked + (t * (kAudible - kMasked));
+    }
+
     private static uint QuantizeLinearValue(float value, float minValue, float maxValue, int totalLevels)
     {
         float clamped = Math.Clamp(value, minValue, maxValue);
