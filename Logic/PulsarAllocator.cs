@@ -56,10 +56,14 @@ public sealed class PulsarAllocator
     private readonly PulsarAllocationConfig _config;
     private readonly PulsarDemandModel _demandModel;
 
-    // LAME-Style BaseGains für V0 bis V9
-    // Q0 = Gain 400 (grobe Quantisierung, geringere Qualität), Q9 = Gain 10 (feinere Quantisierung, höhere Qualität)
-    // In der aktuellen Pipeline liefert das Gesamtverhalten aber dennoch V0 als höchste und V9 als niedrigste Qualität.
-    private static readonly int[] QualityBaseGains = { 400, 350, 300, 250, 200, 150, 100, 60, 30, 10 };
+    // FDK-AAC thrExp^4 quality reduction values (in dB, applied in thrExp = threshold/4 domain).
+    // Negative = strenger (threshold sinkt → mehr Bits nötig → höhere Qualität, Q0/V0).
+    // Positiv = lockerer (threshold steigt → weniger Bits nötig → stärkere Kompression, Q9/V9).
+    // Skalierung: redVal wird in der thrExp-dB-Domäne addiert, dann mit 4 zur effectiveThrDb.
+    private static readonly float[] QualityRedVals = { -9.0f, -7.5f, -6.0f, -4.5f, -3.0f, -1.5f, 0.0f, 1.5f, 3.0f, 4.5f };
+
+    // Schritt-Faktor: 6 dB SNR ≈ 1 Bit; wird für Gain-Ableitung aus SNR-Target verwendet.
+    private const float ThrExpGainStep = 6.0f;
 
     public PulsarAllocator(PulsarAllocationConfig? config = null)
     {
@@ -108,7 +112,8 @@ public sealed class PulsarAllocator
 
     /// <summary>
     /// TRUE VBR (Constant Quality) Quantisierung.
-    /// Ersetzt die alte Binary-Search. Nutzt Ogg Vorbis/LAME Logik.
+    /// Ersetzt die alte Binary-Search. Nutzt Ogg Vorbis/LAME Logik und
+    /// FDK-AAC thrExp^4-Formel für die Gain-Bestimmung.
     /// </summary>
     public PulsarRateControlResult QuantizeFrameVbr(
         float[] mdctSpectrum,
@@ -121,14 +126,27 @@ public sealed class PulsarAllocator
         ArgumentNullException.ThrowIfNull(bandBits);
         ArgumentNullException.ThrowIfNull(psycho);
 
-        // 1. Basis-Gain für das gewählte Quality-Level (0-9)
+        // 1. Basis-Gain aus thrExp^4-Formel (FDK-AAC clean-room Konzept)
+        //    thrExp = thr^(1/4) in der Log-Domäne = thrDb / 4
+        //    redVal = qualitätsgesteuerte Verschiebung (negativ = strenger, positiv = lockerer)
+        //    effectiveThr = (thrExp + redVal)^4 = ((thrDb/4) + redVal)^4
+        //    Dies bestimmt, wie viel Spielraum der Quantisierer gegenüber der Maskierung hat.
         int qualityLevel = Math.Clamp(_config.Quality, 0, 9);
-        int baseGain = QualityBaseGains[qualityLevel];
+        float redValDb = QualityRedVals[qualityLevel]; // dB-Verschiebung in der thrExp-Domäne
 
-        // 2. Perceptual Entropy (PE) Modulation
-        // Hochkomplexe Frames (Transienten) senken den Gain -> mehr Präzision
-        double peModulation = (demand.PePressure - 0.5) * 100.0;
-        int frameGain = baseGain - (int)Math.Round(peModulation);
+        float avgThrExpDb = ComputeAverageThrExpDb(psycho);
+        float effectiveThrExpDb = avgThrExpDb + redValDb;
+
+        // effectiveThrDb = (thrExp)^4 in der Log-Domäne = effectiveThrExpDb * 4
+        float effectiveThrDb = effectiveThrExpDb * 4.0f;
+
+        // 2. Global Gain aus der effektiven Schwelle ableiten.
+        //    Wir wollen: quantization_noise_db ≈ effectiveThrDb
+        //    Da noise_db ≈ energyDb - snrDb und snrDb ≈ gain * 6 dB, gilt:
+        //    gain ≈ (avgEnergyDb - effectiveThrDb) / 6.0
+        float avgEnergyDb = ComputeAverageBandEnergyDb(psycho);
+        float snrTargetDb = avgEnergyDb - effectiveThrDb;
+        int frameGain = (int)Math.Round(snrTargetDb / ThrExpGainStep);
 
         // 3. Stille- und Noise-Floor-Erkennung (Bit-Saver)
         if (psycho.TotalEnergyDb < -48.0f)
@@ -150,6 +168,64 @@ public sealed class PulsarAllocator
             BudgetMet = true,
             QuantizedSpectrum = bestQuantized,
         };
+    }
+
+    /// <summary>
+    /// Berechnet den gewichteten Durchschnitt der thrExp-Werte (= MaskingThreshold / 4 in dB).
+    /// Entspricht FDKaacEnc_calcThreshExp: thrExpLdData = sfbThresholdLdData >> 2.
+    /// Hier in dB: thrExpDb = maskingThresholdDb / 4.
+    /// </summary>
+    private static float ComputeAverageThrExpDb(PulsarPsychoResult psycho)
+    {
+        int bandCount = psycho.MaskingThresholdDb.Length;
+        if (bandCount == 0) return -30.0f; // Fallback
+
+        double sum = 0.0;
+        double weightSum = 0.0;
+
+        for (int b = 0; b < bandCount; b++)
+        {
+            float thrDb = psycho.MaskingThresholdDb[b];
+            float energyDb = GetArrayValue(psycho.SfbBandEnergiesDb, b);
+
+            // Nur Bänder einbeziehen, die über der absoluten Hörschwelle liegen
+            if (energyDb < -90.0f) continue;
+
+            // Gewichtung: Bänder mit hoher Energie beeinflussen den Gain stärker
+            double weight = Math.Max(0.01, energyDb + 100.0); // Energie als Gewicht (0..200)
+            sum += (thrDb / 4.0) * weight;  // thrExp = threshold^(1/4) = thrDb/4 in dB-Domäne
+            weightSum += weight;
+        }
+
+        return weightSum > 0.0 ? (float)(sum / weightSum) : -30.0f;
+    }
+
+    /// <summary>
+    /// Berechnet den gewichteten Durchschnitt der Band-Energien in dB.
+    /// </summary>
+    private static float ComputeAverageBandEnergyDb(PulsarPsychoResult psycho)
+    {
+        int bandCount = psycho.SfbBandEnergiesDb.Length;
+        if (bandCount == 0) return -40.0f;
+
+        double sum = 0.0;
+        int count = 0;
+
+        for (int b = 0; b < bandCount; b++)
+        {
+            float e = psycho.SfbBandEnergiesDb[b];
+            if (e < -90.0f) continue;
+            sum += e;
+            count++;
+        }
+
+        return count > 0 ? (float)(sum / count) : -40.0f;
+    }
+
+    private static float GetArrayValue(float[] arr, int index)
+    {
+        if (arr.Length == 0) return 0.0f;
+        return arr[Math.Min(index, arr.Length - 1)];
     }
 
     private int[] AllocateBandBits(PulsarFrameDemand demandFrame, int nominalBlockBits)
