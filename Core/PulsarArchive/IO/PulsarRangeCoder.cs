@@ -198,6 +198,56 @@ public sealed class PulsarRangeEncoder
 		EncodeSymbol(lowCount, highCount, total);
 	}
 
+	// Opus CELT laplace.c port. Encodes a signed integer under a Laplace-like
+	// distribution parameterised by fs (Q15 probability of 0) and decay (Q15
+	// per-step decay of the two-sided tail). Symmetric-symbol update runs in
+	// the 15-bit binary domain (total = 32768). Returns possibly-clamped value
+	// via out param (Opus mutates *value in-place when tail saturates).
+	public int LaplaceEncode(int value, uint fs, int decay)
+	{
+		const int LaplaceMinP = 1;
+		uint fl = 0;
+		int val = value;
+		if (val != 0)
+		{
+			int s = val < 0 ? -1 : 0;
+			val = (val + s) ^ s;
+			fl = fs;
+			fs = LaplaceGetFreq1(fs, decay);
+			int i;
+			for (i = 1; fs > 0 && i < val; i++)
+			{
+				fs *= 2;
+				fl += fs + 2u * LaplaceMinP;
+				fs = (uint)((fs * (long)decay) >> 15);
+			}
+			if (fs == 0)
+			{
+				int ndiMax = (int)((32768u - fl + LaplaceMinP - 1u) >> 0);
+				ndiMax = (ndiMax - s) >> 1;
+				int di = Math.Min(val - i, ndiMax - 1);
+				fl += (uint)((2 * di + 1 + s) * LaplaceMinP);
+				fs = Math.Min((uint)LaplaceMinP, 32768u - fl);
+				value = (i + di + s) ^ s;
+			}
+			else
+			{
+				fs += LaplaceMinP;
+				fl += fs & (uint)~s;
+			}
+		}
+		EncodeSymbol(fl, fl + fs, 32768);
+		return value;
+	}
+
+	private static uint LaplaceGetFreq1(uint fs0, int decay)
+	{
+		const int LaplaceMinP = 1;
+		const int LaplaceNMin = 16;
+		uint ft = 32768u - (uint)(LaplaceMinP * 2 * LaplaceNMin) - fs0;
+		return (uint)((ft * (long)(16384 - decay)) >> 15);
+	}
+
 	public byte[] Finish()
 	{
 		EnsureNotFinished();
@@ -652,6 +702,53 @@ public sealed class PulsarRangeDecoder
 		}
 
 		throw new InvalidOperationException("Failed to decode 16-bit ICDF symbol.");
+	}
+
+	public int LaplaceDecode(uint fs, int decay)
+	{
+		const int LaplaceMinP = 1;
+		int val = 0;
+		uint fm = GetTarget(32768);
+		uint fl = 0;
+		if (fm >= fs)
+		{
+			val++;
+			fl = fs;
+			fs = LaplaceGetFreq1Decode(fs, decay) + LaplaceMinP;
+			while (fs > LaplaceMinP && fm >= fl + 2 * fs)
+			{
+				fs *= 2;
+				fl += fs;
+				fs = (uint)(((fs - 2u * LaplaceMinP) * (long)decay) >> 15);
+				fs += LaplaceMinP;
+				val++;
+			}
+			if (fs <= LaplaceMinP)
+			{
+				int di = (int)((fm - fl) >> 1);
+				val += di;
+				fl += (uint)(2 * di * LaplaceMinP);
+			}
+			if (fm < fl + fs)
+			{
+				val = -val;
+			}
+			else
+			{
+				fl += fs;
+			}
+		}
+		uint high = Math.Min(fl + fs, 32768u);
+		Update(fl, high, 32768);
+		return val;
+	}
+
+	private static uint LaplaceGetFreq1Decode(uint fs0, int decay)
+	{
+		const int LaplaceMinP = 1;
+		const int LaplaceNMin = 16;
+		uint ft = 32768u - (uint)(LaplaceMinP * 2 * LaplaceNMin) - fs0;
+		return (uint)((ft * (long)(16384 - decay)) >> 15);
 	}
 
 	private void Normalize()

@@ -1,0 +1,19 @@
+Planning
+
+Block Switching
+
+44,1kHz / 19kHz Cuttoff (Damit wir keine Bits verschwenden, da Menschen oft nicht über 18kHz hören)
+
+Psycho Model
+
+MDCT / TDAC
+
+Bit Verteilung Reservoir Global (Die bits müssen Global sehr clever verteilt werden um die best mögliche Qualität SNR / PSNR und Psycho Akkustisches ergebniss zu haben heißt nicht unnötig bits rein pumpen wenn es wenige bänder gibt die gefüllt werden müssen zmbsp.)
+
+Allocator
+
+Quantizer
+
+Range Coder (Maybe CABAC or ANS in future)
+
+Quantizer verfeinern

@@ -50,7 +50,15 @@ The current CLI supports:
 - `--decodeplsr`
 - `--compare`
 
-Supported quality levels are currently `-V 0` through `-V 9`. The focus is on PCM rendering and quality-controlled VBR behavior, not on a fixed bitrate mode.
+Supported quality levels are currently `-V 1` through `-V 3`. These are approximate VBR targets, not hard CBR promises:
+
+| Level | Nominal target |
+| --- | ---: |
+| `-V 1` | ~320 kbps |
+| `-V 2` | ~256 kbps |
+| `-V 3` | ~128 kbps |
+
+The focus is on PCM rendering and quality-controlled VBR behavior, not on a fixed bitrate mode.
 
 ## What is implemented today
 
@@ -86,4 +94,5 @@ dotnet build PulsarCodec.csproj
 
 - This repository is private and tracks experimental data, reference material, and development artifacts.
 - `Reference Open Source/` and `TestWAVs/` are intentionally included in the repo for inspection.
+- `Tools/compare_audio_metrics.py` compares RAW tracks against lossy outputs and Pulsar renders, reporting SNR, PSNR, residuals, bitrate, and file size. It expects `ffmpeg` and `ffprobe` on `PATH`.
 - The current focus is on architecture validation, not final packaging.

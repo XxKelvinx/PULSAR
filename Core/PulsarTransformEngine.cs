@@ -420,7 +420,7 @@ public static class PulsarTransformEngine
             ComputeDct4(workspace.FoldedInput, workspace.Spectrum, plan, workspace);
 
             var quantContext = BuildQuantizationContext(currentInputPos, currentBlockSize, allocations, psychoFrames);
-            PulsarQuantizer.QuantizeSpectrum(workspace.Spectrum, quantContext.BandBits, quantContext.Psycho);
+            PulsarQuantizer.QuantizeSpectrum(workspace.Spectrum, quantContext.PulseBudget, quantContext.Psycho);
 
             ComputeInverseDct4(workspace.Spectrum, workspace.FoldedOutput, plan, workspace);
 
@@ -453,7 +453,7 @@ public static class PulsarTransformEngine
         return trimmed;
     }
 
-    private static (int[] BandBits, Pulsar.Psycho.PulsarPsychoResult Psycho) BuildQuantizationContext(
+    private static (int PulseBudget, Pulsar.Psycho.PulsarPsychoResult Psycho) BuildQuantizationContext(
         int offset,
         int blockSize,
         IReadOnlyList<PulsarFrameAllocation> allocations,
@@ -463,28 +463,17 @@ public static class PulsarTransformEngine
         int startSegment = Math.Clamp(offset / controlHop, 0, allocations.Count - 1);
         int endSegment = Math.Clamp((int)Math.Ceiling((offset + blockSize) / (double)controlHop) - 1, startSegment, allocations.Count - 1);
         int centerSegment = Math.Clamp(((offset + (blockSize / 2)) / controlHop), 0, psychoFrames.Count - 1);
-        int bandCount = allocations[centerSegment].BandBits.Length;
-        int[] averagedBandBits = new int[bandCount];
+        int pulseBudget = 0;
 
         for (int segmentIndex = startSegment; segmentIndex <= endSegment; segmentIndex++)
         {
-            int[] sourceBits = allocations[segmentIndex].BandBits;
-            for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
-            {
-                averagedBandBits[bandIndex] += sourceBits[Math.Min(bandIndex, sourceBits.Length - 1)];
-            }
+            pulseBudget += allocations[segmentIndex].PulseBudget;
         }
 
-        int segmentCount = endSegment - startSegment + 1;
-        if (segmentCount > 1)
-        {
-            for (int bandIndex = 0; bandIndex < bandCount; bandIndex++)
-            {
-                averagedBandBits[bandIndex] /= segmentCount;
-            }
-        }
+        int segmentCount = Math.Max(1, endSegment - startSegment + 1);
+        pulseBudget = Math.Max(1, (int)Math.Round(pulseBudget / (double)segmentCount));
 
-        return (averagedBandBits, psychoFrames[centerSegment]);
+        return (pulseBudget, psychoFrames[centerSegment]);
     }
 
     // --- ASYMMETRISCHE FENSTER GENERIERUNG (SIMD-Optimiert) ---

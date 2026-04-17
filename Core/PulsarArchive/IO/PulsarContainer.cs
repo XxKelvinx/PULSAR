@@ -22,6 +22,7 @@ public sealed class PulsarContainerHeader
 	public ushort Flags { get; set; }
 	public long TotalSamples { get; set; }
 	public uint SeekTableOffsetBytes { get; set; }
+	public ushort BandwidthLimitHz { get; set; } = 19000;
 	public int AnalysisFrameSize { get; set; } = PulsarBlockLadder.AnalysisFrameSize;
 	public int ControlHopSize { get; set; } = PulsarBlockLadder.ControlHopSize;
 	public int MinBlockSize { get; set; } = PulsarBlockLadder.MinBlockSize;

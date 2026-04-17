@@ -51,7 +51,7 @@ def build_command(mode: str, input_wav: Path, quality: int, block_size: int) -> 
         return None
 
     stem = input_wav.stem
-    work = REPO_ROOT / "Artifacts" / "out-gui"
+    work = MODE_FOLDERS[mode]
     work.mkdir(parents=True, exist_ok=True)
 
     if mode == "legacy":
@@ -94,7 +94,7 @@ class PulsarGui(tk.Tk):
 
         self.input_path = tk.StringVar()
         self.mode = tk.StringVar(value="legacy")
-        self.quality = tk.IntVar(value=5)
+        self.quality = tk.IntVar(value=2)
         self.block_size = tk.IntVar(value=2048)
         self.status = tk.StringVar(value="idle")
         self._proc_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -174,8 +174,8 @@ class PulsarGui(tk.Tk):
         prow = tk.Frame(params_frame, bg=BG)
         prow.pack(fill="x", padx=8, pady=8)
 
-        tk.Label(prow, text="Quality (-V):", bg=BG, fg=FG, font=FONT_MAIN).grid(row=0, column=0, sticky="w")
-        self.quality_scale = tk.Scale(prow, from_=0, to=9, orient="horizontal",
+        tk.Label(prow, text="Quality mode (-V):", bg=BG, fg=FG, font=FONT_MAIN).grid(row=0, column=0, sticky="w")
+        self.quality_scale = tk.Scale(prow, from_=1, to=3, orient="horizontal",
                                       variable=self.quality, bg=BG, fg=FG,
                                       troughcolor="#002030", activebackground=ACCENT,
                                       highlightbackground=BG, font=FONT_MAIN,

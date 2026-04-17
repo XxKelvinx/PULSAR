@@ -2,11 +2,11 @@ using System;
 
 public static class PulsarBlockLadder
 {
-	public static readonly int[] Steps = [256, 512, 1024, 2048, 4096, 8192, 16384];
+	public static readonly int[] Steps = [256, 512, 1024, 2048];
 
 	public const int MinBlockSize = 256;
 	public const int DefaultBlockSize = 2048;
-	public const int MaxBlockSize = 16384;
+	public const int MaxBlockSize = 2048;
 	public const int AnalysisFrameSize = MaxBlockSize;
 	public const int ControlHopSize = 256;
 

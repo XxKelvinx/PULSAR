@@ -92,7 +92,7 @@ public sealed class PulsarPacker
 		bitstream.WriteUInt16(header.Flags);
 		bitstream.WriteUInt32((uint)header.SampleRate);
 		bitstream.WriteUInt16((ushort)header.ChannelCount);
-		bitstream.WriteUInt16(0);
+		bitstream.WriteUInt16(header.BandwidthLimitHz);
 		bitstream.WriteUInt64((ulong)header.TotalSamples);
 		bitstream.WriteUInt32((uint)superframeCount);
 		bitstream.WriteUInt32(header.SeekTableOffsetBytes);
@@ -111,7 +111,7 @@ public sealed class PulsarPacker
 		container.Header.Flags = bitstream.ReadUInt16();
 		container.Header.SampleRate = checked((int)bitstream.ReadUInt32());
 		container.Header.ChannelCount = bitstream.ReadUInt16();
-		_ = bitstream.ReadUInt16();
+		container.Header.BandwidthLimitHz = bitstream.ReadUInt16();
 		container.Header.TotalSamples = checked((long)bitstream.ReadUInt64());
 		superframeCount = checked((int)bitstream.ReadUInt32());
 		container.Header.SeekTableOffsetBytes = bitstream.ReadUInt32();

@@ -58,6 +58,15 @@ public sealed class PulsarFramePlan
     public int BandCount => BlockSize / 2;
 }
 
+public static class PulsarPlannerOutputFormat
+{
+    public const int SchemaVersion = 2;
+
+    public const string AnalysisCsvHeader = "segment_index,time_s,transient_level,attack_ratio,peak_delta_db,attack_index,energy_modulation,crest_factor,low_band_ratio,high_band_ratio,sustained_high_band_ratio,desired_ladder_position,clue_strength,pre_echo_risk,spectral_flux,sub_bass,bass,low_mid,mid,high_mid,presence,brilliance,centroid,flatness";
+    public const string PlanCsvHeader = "segment_index,time_s,previous_block_size,block_size,next_block_size,target_block_size,direction,transient_level,pre_echo_risk,spectral_flux,clue_strength,desired_ladder_position";
+    public const string RenderCsvHeader = "frame_index,start_time_s,segment_index,previous_block_size,block_size,next_block_size,target_block_size,direction,transient_level,pre_echo_risk,spectral_flux,clue_strength";
+}
+
 /// <summary>
 /// Multi-band spectral energy profile for a single analysis segment.
 /// Frequencies are approximate assuming 44100 Hz sample rate.
@@ -215,15 +224,15 @@ public sealed class PulsarPlanner
 {
     private const int LegacyRenderQuantum = PulsarBlockLadder.MinBlockSize / 2;
 
-    // ── Full block ladder: 7 steps from 256 to 16384 ──
-    private static readonly int[] BlockSteps = { 256, 512, 1024, 2048, 4096, 8192, 16384 };
+    // ── Full block ladder: 4 steps from 256 to 2048 ──
+    private static readonly int[] BlockSteps = { 256, 512, 1024, 2048 };
     private static readonly int StateCount = BlockSteps.Length;
     private static readonly int DefaultStateIndex = Array.IndexOf(BlockSteps, PulsarBlockLadder.DefaultBlockSize);
     private static readonly int ContextSegmentCount = PulsarBlockLadder.DefaultBlockSize / PulsarBlockLadder.ControlHopSize;
     private static readonly int[] ContextEligibleStates = { 0, 1, 2, 3 };
-    private static readonly int[] LargeBlockPromotionStates = { 6, 5, 4 };
-    private static readonly double[] TransientStateBias = { -0.58, -0.24, 0.08, 0.42, 0.78, 1.02, 1.18 };
-    private static readonly double[] BassStateBias = { 0.60, 0.28, 0.04, -0.24, -0.46, -0.62, -0.72 };
+    private static readonly int[] LargeBlockPromotionStates = Array.Empty<int>();
+    private static readonly double[] TransientStateBias = { -0.58, -0.24, 0.08, 0.42 };
+    private static readonly double[] BassStateBias = { 0.60, 0.28, 0.04, -0.24 };
     private static readonly double[] CalmStateBias = { 0.18, 0.08, 0.00, -0.09, -0.16, -0.22, -0.26 };
 
     private readonly PulsarPlannerSettings _settings;
@@ -1176,6 +1185,13 @@ public sealed class PulsarPlanner
                     double attackWeight = Math.Min(future.AttackRatio / HardTransientThreshold, 1.0);
                     maxRisk = Math.Max(maxRisk, distanceFade * attackWeight * 0.5);
                 }
+
+                // Also detect upcoming spectral flux spikes (pre-echo precursor)
+                if (future.SpectralFlux > 0.3 && future.Level == PulsarTransientLevel.None)
+                {
+                    double distanceFade = 1.0 / ahead;
+                    maxRisk = Math.Max(maxRisk, distanceFade * future.SpectralFlux * 0.4);
+                }
             }
 
             // Also consider high spectral flux as pre-echo indicator
@@ -1183,6 +1199,17 @@ public sealed class PulsarPlanner
             if (current.SpectralFlux > 0.4 && current.Level == PulsarTransientLevel.None)
             {
                 maxRisk = Math.Max(maxRisk, current.SpectralFlux * 0.6);
+            }
+
+            // Energy modulation rising sharply also signals pre-echo risk
+            if (i > 0 && current.EnergyModulation > 0.35)
+            {
+                double prevMod = analyses[i - 1].EnergyModulation;
+                double modDelta = current.EnergyModulation - prevMod;
+                if (modDelta > 0.15)
+                {
+                    maxRisk = Math.Max(maxRisk, Math.Clamp(modDelta * 1.2, 0, 0.8));
+                }
             }
 
             // Rebuild with pre-echo risk filled in
@@ -1279,6 +1306,18 @@ public sealed class PulsarPlanner
         if (spectralFlux <= 0.08 && energyModulation <= 0.10 && bassNeed >= 0.78)
         {
             basePosition = Math.Max(basePosition, 5.10);
+        }
+
+        // Promote to largest blocks when the signal is very calm and tonal (high frequency resolution benefits)
+        if (spectralFlux <= 0.05 && energyModulation <= 0.06 && tonalNeed >= 0.65 && transientNeed <= 0.10)
+        {
+            basePosition = Math.Max(basePosition, 5.80);
+        }
+
+        // Pull down from large blocks when pre-echo risk is elevated via flux
+        if (spectralFlux >= 0.25 && transientNeed >= 0.30)
+        {
+            basePosition = Math.Min(basePosition, 3.5 - (transientNeed * 2.0));
         }
 
         return Math.Clamp(basePosition, 0.0, StateCount - 1.0);
@@ -1979,13 +2018,13 @@ public sealed class PulsarPlanner
         for (int segmentIndex = 0; segmentIndex < stateSequence.Count; segmentIndex++)
         {
             var analysis = analyses[segmentIndex];
-            int stateIndex = stateSequence[segmentIndex];
+            int stateIndex = Math.Clamp(stateSequence[segmentIndex], 0, StateCount - 1);
             int blockSize = BlockSteps[stateIndex];
             int targetBlockSize = BlockSteps[(int)Math.Round(Math.Clamp(analysis.DesiredLadderPosition, 0, StateCount - 1))];
             int previousStateIndex = segmentIndex == 0 ? DefaultStateIndex : stateSequence[segmentIndex - 1];
             int directionIndex = DirFromDelta(stateIndex - previousStateIndex);
 
-            int nextBlockSize = segmentIndex == stateSequence.Count - 1 ? blockSize : BlockSteps[stateSequence[segmentIndex + 1]];
+            int nextBlockSize = segmentIndex == stateSequence.Count - 1 ? blockSize : BlockSteps[Math.Clamp(stateSequence[segmentIndex + 1], 0, StateCount - 1)];
 
             plans.Add(new PulsarFramePlan
             {
@@ -2159,13 +2198,13 @@ public sealed class PulsarPlanner
         for (int s = 0; s < segCount; s++)
         {
             var a = analyses[s];
-            int si = stateSeq[s];
+            int si = Math.Clamp(stateSeq[s], 0, StateCount - 1);
             int blockSize = BlockSteps[si];
             int targetBlockSize = BlockSteps[(int)Math.Round(Math.Clamp(a.DesiredLadderPosition, 0, StateCount - 1))];
             int prevSi = s == 0 ? defIdx : stateSeq[s - 1];
             int dirIdx = DirFromDelta(si - prevSi);
 
-            int nextBlockSize = s == segCount - 1 ? blockSize : BlockSteps[stateSeq[s + 1]];
+            int nextBlockSize = s == segCount - 1 ? blockSize : BlockSteps[Math.Clamp(stateSeq[s + 1], 0, StateCount - 1)];
 
             plans.Add(new PulsarFramePlan
             {
@@ -2382,6 +2421,9 @@ public sealed class PulsarPlanner
         if (blockSize >= 2048)
             return risk * _settings.PreEchoPenalty;
 
+        if (blockSize >= 1024)
+            return risk * _settings.PreEchoPenalty * 0.6; // 1024 still has ~23ms pre-echo window
+
         // Small blocks: reduce pre-echo penalty (they handle it better)
         if (blockSize <= 512)
             return risk * _settings.PreEchoPenalty * -0.2; // bonus for being small
@@ -2582,6 +2624,7 @@ public sealed class PulsarPlanner
                     _ => 4,
                 });
 
+                targetState = Math.Min(targetState, StateCount - 1);
                 states[idx] = Math.Max(states[idx], targetState);
             }
         }

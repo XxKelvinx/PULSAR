@@ -1,5 +1,13 @@
 # Ignore generated output only
 Artifacts/Output/
+Artifacts/out-test/
+
+# Ignore test tracks (large audio files)
+Artifacts/Test Tracks/
+
+# Ignore reference source code (third-party)
+Reference Open Source/
+opus-main/
 
 # Ignore build artifacts
 bin/
