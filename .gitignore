@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Audio Data & Large Binaries
+Output/
+*.wav
+*.pcm
+*.flac
+*.mp3
+*.ogg
+*.opus
+
+# Telemetry data and temporary CSVs
+*.csv
+*.bit
+
+# Windows executable and build artifacts
+opus_demo.exe
+*.ilk
+*.suo
+*.pdb
+*.dll
+*.obj
+*.exe
+
+# CMake / IDE
+build/
+.vs/
+.vscode/
+.idea/
+
+# macOS / OS X
+.DS_Store
