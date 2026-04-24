@@ -1,0 +1,72 @@
+﻿[
+    {
+        "name":  "01_geilo_daft_punk_one_more_time",
+        "pool":  "Geilomatiko",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Geilomatiko - FLAC\\01 - Daft Punk - One More Time.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\01_geilo_daft_punk_one_more_time.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\01_geilo_daft_punk_one_more_time.wav"
+    },
+    {
+        "name":  "02_geilo_chase_status_baddadan",
+        "pool":  "Geilomatiko",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Geilomatiko - FLAC\\01 - Chase \u0026 Status - Baddadan.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\02_geilo_chase_status_baddadan.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\02_geilo_chase_status_baddadan.wav"
+    },
+    {
+        "name":  "03_geilo_fred_again_leavemealone",
+        "pool":  "Geilomatiko",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Geilomatiko - FLAC\\01 - Fred again.. - leavemealone.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\03_geilo_fred_again_leavemealone.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\03_geilo_fred_again_leavemealone.wav"
+    },
+    {
+        "name":  "04_geilo_dua_lipa_dance_the_night",
+        "pool":  "Geilomatiko",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Geilomatiko - FLAC\\01 - Dua Lipa - Dance The Night (From Barbie The Album).flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\04_geilo_dua_lipa_dance_the_night.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\04_geilo_dua_lipa_dance_the_night.wav"
+    },
+    {
+        "name":  "05_muss_6arelyhuman_bloodbath",
+        "pool":  "Muss los",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Muss los - FLAC\\01 - 6arelyhuman - BLOODBATH.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\05_muss_6arelyhuman_bloodbath.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\05_muss_6arelyhuman_bloodbath.wav"
+    },
+    {
+        "name":  "06_muss_cyrex_kyoto",
+        "pool":  "Muss los",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Muss los - FLAC\\01 - Cyrex - KYOTO.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\06_muss_cyrex_kyoto.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\06_muss_cyrex_kyoto.wav"
+    },
+    {
+        "name":  "07_muss_cade_clair_who_cares",
+        "pool":  "Muss los",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Muss los - FLAC\\01 - cade clair - Who Cares.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\07_muss_cade_clair_who_cares.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\07_muss_cade_clair_who_cares.wav"
+    },
+    {
+        "name":  "08_tokyo_anamanaguchi_miku",
+        "pool":  "Tokyo",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Tokyo - FLAC\\01 - Anamanaguchi - Miku.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\08_tokyo_anamanaguchi_miku.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\08_tokyo_anamanaguchi_miku.wav"
+    },
+    {
+        "name":  "09_tokyo_creepy_nuts_otonoke",
+        "pool":  "Tokyo",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Tokyo - FLAC\\01 - Creepy Nuts - Otonoke.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\09_tokyo_creepy_nuts_otonoke.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\09_tokyo_creepy_nuts_otonoke.wav"
+    },
+    {
+        "name":  "10_tokyo_yoasobi_idol",
+        "pool":  "Tokyo",
+        "source":  "C:\\Users\\eller\\Desktop\\Playlist\\Tokyo - FLAC\\01 - YOASOBI - アイドル.flac",
+        "flac":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\flac\\10_tokyo_yoasobi_idol.flac",
+        "wav":  "C:\\Users\\eller\\Desktop\\PULSAR V.2\\Test-Songs\\wav\\10_tokyo_yoasobi_idol.wav"
+    }
+]
